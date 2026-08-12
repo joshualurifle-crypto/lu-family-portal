@@ -114,6 +114,7 @@ function newHand(){
   G.players.forEach(p=>{ p.hole=[]; p.folded=false; p.allIn=false; p.bet=0; p.total=0;
     p.inHand=p.chips>0; p.won=false; p.showName=""; p.need=false; p.handBet=0; });
   G.dealer=nextSeat(G.dealer,p=>p.chips>0);
+  EQC={}; EQCN=0;
   G.deck=newDeck(); G.board=[]; G.stage=0; G.curBet=G.bbA; G.betsCount=1; G.lastRaise=G.bbA; G.handOver=false;
   const liveN=G.players.filter(p=>p.inHand).length;
   G.sb = liveN===2 ? G.dealer : nextSeat(G.dealer,p=>p.inHand);
@@ -325,6 +326,179 @@ function strength(i){
   return Math.min(0.18+v[0]*0.11+(v[1]||0)/140,0.97);
 }
 /* ---------- coach ---------- */
+/* fast 7-card evaluator -> single comparable integer (cat*15^5 + kickers) */
+const P15=[759375,50625,3375,225,15,1];
+function ev7(cs){
+  const rc=new Array(15).fill(0), sc=[0,0,0,0], sm=[0,0,0,0];
+  let rm=0;
+  for(let i=0;i<cs.length;i++){ const c=cs[i]; rc[c.r]++; sc[c.s]++; sm[c.s]|=1<<c.r; rm|=1<<c.r; }
+  const sHi=m=>{ if(m&(1<<14)) m|=2; let run=0;
+    for(let r=14;r>=1;r--){ if(m&(1<<r)){ if(++run===5) return r+4; } else run=0; } return 0; };
+  let fs=-1; for(let s=0;s<4;s++) if(sc[s]>=5){ fs=s; break; }
+  if(fs>=0){ const sf=sHi(sm[fs]); if(sf) return 8*P15[0]+sf*P15[1]; }
+  let quad=0; const trips=[], pairs=[];
+  for(let r=14;r>=2;r--){ if(rc[r]===4) quad=r; else if(rc[r]===3) trips.push(r); else if(rc[r]===2) pairs.push(r); }
+  if(quad){ let k=0; for(let r=14;r>=2;r--) if(r!==quad&&rc[r]>0){ k=r; break; }
+    return 7*P15[0]+quad*P15[1]+k*P15[2]; }
+  if(trips.length&&(pairs.length||trips.length>1))
+    return 6*P15[0]+trips[0]*P15[1]+Math.max(pairs[0]||0,trips[1]||0)*P15[2];
+  if(fs>=0){ let v=5*P15[0],n=0; for(let r=14;r>=2&&n<5;r--) if(sm[fs]&(1<<r)) v+=r*P15[++n]; return v; }
+  const st=sHi(rm); if(st) return 4*P15[0]+st*P15[1];
+  if(trips.length){ let v=3*P15[0]+trips[0]*P15[1],n=1;
+    for(let r=14;r>=2&&n<3;r--) if(r!==trips[0]&&rc[r]>0) v+=r*P15[++n]; return v; }
+  if(pairs.length>=2){ let k=0; for(let r=14;r>=2;r--) if(r!==pairs[0]&&r!==pairs[1]&&rc[r]>0){ k=r; break; }
+    return 2*P15[0]+pairs[0]*P15[1]+pairs[1]*P15[2]+k*P15[3]; }
+  if(pairs.length===1){ let v=1*P15[0]+pairs[0]*P15[1],n=1;
+    for(let r=14;r>=2&&n<4;r--) if(r!==pairs[0]&&rc[r]>0) v+=r*P15[++n]; return v; }
+  let v=0,n=0; for(let r=14;r>=2&&n<5;r--) if(rc[r]>0) v+=r*P15[++n]; return v;
+}
+const catOf=v=>Math.floor(v/P15[0]);
+
+/* Monte-Carlo equity vs N random opponents, cached per (hole,board,opps) */
+let EQC={}, EQCN=0;
+function mcEquity(hole,board,nOpp,sims){
+  const k=c=>c.r*4+c.s;
+  const key=hole.map(k).sort((a,b)=>a-b).join(",")+"|"+board.map(k).join(",")+"|"+nOpp;
+  if(EQC[key]!==undefined) return EQC[key];
+  const known={}; hole.concat(board).forEach(c=>known[c.s*100+c.r]=1);
+  const deck=[]; for(let s=0;s<4;s++) for(let r=2;r<=14;r++) if(!known[s*100+r]) deck.push({r,s});
+  const needB=5-board.length, take=needB+2*nOpp;
+  let win=0,tie=0;
+  for(let t=0;t<sims;t++){
+    for(let j=0;j<take;j++){ const q=j+Math.floor(Math.random()*(deck.length-j));
+      const tmp=deck[j]; deck[j]=deck[q]; deck[q]=tmp; }
+    const full=board.concat(deck.slice(0,needB));
+    const mine=ev7(hole.concat(full));
+    let beat=false,tied=false;
+    for(let o=0;o<nOpp;o++){
+      const v=ev7([deck[needB+2*o],deck[needB+2*o+1]].concat(full));
+      if(v>mine){ beat=true; break; } if(v===mine) tied=true;
+    }
+    if(beat) continue; if(tied) tie++; else win++;
+  }
+  const e=(win+tie*0.5)/sims;
+  if(EQCN>600){ EQC={}; EQCN=0; }
+  EQC[key]=e; EQCN++; return e;
+}
+/* unseen cards that lift you to a BETTER, actually-winning hand
+   (a new pair only counts if it beats the top board card) */
+function outsCount(hole,board){
+  if(board.length<3||board.length>=5) return 0;
+  const topB=Math.max.apply(null,board.map(c=>c.r));
+  const cur=catOf(ev7(hole.concat(board)));
+  const known={}; hole.concat(board).forEach(c=>known[c.s*100+c.r]=1);
+  const pairRank=cards=>{ const rc={}; cards.forEach(c=>rc[c.r]=(rc[c.r]||0)+1);
+    return Math.max.apply(null,Object.keys(rc).filter(r=>rc[r]>=2).map(Number).concat([0])); };
+  let n=0;
+  for(let s=0;s<4;s++) for(let r=2;r<=14;r++){ if(known[s*100+r]) continue;
+    const all=hole.concat(board,[{r,s}]); const c=catOf(ev7(all));
+    if(c<=cur) continue;
+    if(c===1&&pairRank(all)<=topB) continue;   // low pair is not an out
+    n++; }
+  return n;
+}
+function preflopLabel(hole){
+  const [a,b]=hole; const hi=Math.max(a.r,b.r), lo=Math.min(a.r,b.r);
+  if(a.r===b.r) return "Pocket "+rName(a.r)+"s";
+  return rName(hi)+rName(lo)+(a.s===b.s?" suited":" offsuit");
+}
+function madeDesc(hole,board){
+  const all=hole.concat(board); const v=ev7(all); const cat=catOf(v);
+  const rc={}; all.forEach(c=>rc[c.r]=(rc[c.r]||0)+1);
+  const br=[...new Set(board.map(c=>c.r))].sort((x,y)=>y-x);
+  if(cat===1){
+    const pr=Object.keys(rc).map(Number).filter(r=>rc[r]===2).sort((x,y)=>y-x)[0];
+    const pocket=hole[0].r===hole[1].r;
+    let q="Weak pair";
+    if(pocket&&pr>br[0]) q="Overpair"; else if(pr===br[0]) q="Top pair";
+    else if(pr===br[1]) q="Second pair"; else if(pocket) q="Underpair";
+    const kick=hole.map(c=>c.r).filter(r=>r!==pr).sort((x,y)=>y-x)[0];
+    return q+" — "+rName(pr)+"s"+(kick?", "+rName(kick)+" kicker":"");
+  }
+  if(cat===3){ const tr=Object.keys(rc).map(Number).filter(r=>rc[r]===3)[0];
+    const inHole=hole.filter(c=>c.r===tr).length;
+    return (inHole===2?"Set of ":"Trip ")+rName(tr)+"s"; }
+  if(cat===0){ const hi=hole.map(c=>c.r).sort((x,y)=>y-x)[0];
+    const over=hole.filter(c=>c.r>br[0]).length;
+    return "No pair — "+rName(hi)+" high"+(over?" ("+over+" overcard"+(over>1?"s":"")+")":""); }
+  return HAND_NAMES[cat];
+}
+function texture(board){
+  if(board.length<3) return "";
+  const t=[]; const sc={}; board.forEach(c=>sc[c.s]=(sc[c.s]||0)+1);
+  const mx=Math.max.apply(null,Object.keys(sc).map(k=>sc[k]));
+  if(mx>=3) t.push("flush-heavy"); else if(mx===2) t.push("two-tone"); else t.push("rainbow");
+  const rs=[...new Set(board.map(c=>c.r))].sort((a,b)=>a-b);
+  if(rs.length<board.length) t.push("paired");
+  for(let i=0;i+2<rs.length;i++) if(rs[i+2]-rs[i]<=4){ t.push("connected"); break; }
+  if(rs[rs.length-1]>=12) t.push("high card out");
+  return t.join(" · ");
+}
+function posName(i){
+  const n=G.players.filter(p=>p.inHand).length;
+  if(n<=2) return i===G.dealer? "BTN/SB — first in, last after" : "BB — last pre-flop";
+  const off=(i-G.dealer+G.players.length)%G.players.length;
+  return ["BTN (best — act last)","SB (worst — act first)","BB","UTG (act first)","CO"][off]||"MP";
+}
+/* the advanced coach: numbers first, then a verdict */
+function coachAdv(i){
+  const p=G.players[i];
+  if(!p.hole.length||G.phase!=="play"||G.stage>=4||p.folded) return null;
+  const opp=G.players.filter((q,j)=>j!==i&&q.inHand&&!q.folded).length;
+  if(opp<1) return null;
+  const eq=mcEquity(p.hole,G.board,opp,G.stage===0?900:700);
+  const pot=potTotal(), owe=Math.max(0,G.curBet-p.bet);
+  const need=owe>0? owe/(pot+owe) : 0;
+  const outs=outsCount(p.hole,G.board);
+  const rows=[];
+  const fair=1/(opp+1);
+  rows.push(["Hand", G.stage===0? preflopLabel(p.hole) : madeDesc(p.hole,G.board)]);
+  rows.push(["Seat", posName(i)+" · "+opp+" live opponent"+(opp>1?"s":"")]);
+  rows.push(["Equity", Math.round(eq*100)+"% to win at showdown"]);
+  rows.push(["Fair share", Math.round(fair*100)+"% ("+(opp+1)+"-way) — you are "+
+    (eq>fair? "ahead of average":"below average")]);
+  if(outs) rows.push(["Outs", outs+" outs ≈ "+Math.round(outs*(G.stage===1?4:2))+"% to improve"]);
+  if(G.stage>0) rows.push(["Board", texture(G.board)]);
+  if(owe>0) rows.push(["Pot odds","call "+owe+" into "+pot+" → need "+Math.round(need*100)+"%, you have "+Math.round(eq*100)+"%"]);
+  if(G.stage>0&&pot>0) rows.push(["SPR", (p.chips/pot).toFixed(1)+" (stack ÷ pot)"+(p.chips/pot<3?" — short, commit or fold":"")]);
+  let verdict, why, tone;
+  if(G.stage===0){
+    /* pre-flop: judge against fair share, discount the price for implied odds */
+    if(eq>fair*1.30&&canRaise(i)){ verdict="RAISE — for value"; tone="good";
+      why="You are "+Math.round(eq*100)+"% against "+opp+" random hands, well over the "+Math.round(fair*100)+"% average. Raise to thin the field and build the pot."; }
+    else if(eq>fair*1.05){ verdict=owe>0?"CALL":"CHECK — happy to see a flop"; tone="ok";
+      why="Above average for a "+(opp+1)+"-way pot. Playable, but not strong enough to raise from "+posName(i).split(" ")[0]+"."; }
+    else if(owe>0&&eq>need*0.85){ verdict="CALL — cheap"; tone="ok";
+      why="Below average, but only "+owe+" to see a flop. Fold to any real raise behind you."; }
+    else { verdict=owe>0?"FOLD":"CHECK"; tone="bad";
+      why="Only "+Math.round(eq*100)+"% against "+opp+" hands versus a "+Math.round(fair*100)+"% average share. This hand loses money long-run."; }
+  } else if(owe>0){
+    const edge=eq-need;
+    if(eq<need*0.92){ verdict="FOLD"; tone="bad";
+      why="You need "+Math.round(need*100)+"% to break even and only have "+Math.round(eq*100)+"%. Calling loses money over time."
+        +(outs>=8?" (Call only if you expect to get paid big when you hit.)":""); }
+    else if(eq>0.72&&canRaise(i)){ verdict="RAISE — for value"; tone="good";
+      why="You are ahead of most hands still in. Build the pot now, not on the river."; }
+    else if(edge>0.08){ verdict="CALL"; tone="ok";
+      why="Price is "+Math.round(need*100)+"%, your equity is "+Math.round(eq*100)+"% — profitable, but not strong enough to raise."; }
+    else { verdict="CALL — marginal"; tone="ok";
+      why="Barely profitable ("+Math.round(eq*100)+"% vs "+Math.round(need*100)+"% needed). Fold instead if you act first on the next street."; }
+  } else {
+    if(eq>0.70&&canRaise(i)){ verdict="BET — for value"; tone="good";
+      why="You are ahead. Charge the draws; checking here just gives free cards."; }
+    else if(outs>=8&&canRaise(i)){ verdict="BET — semi-bluff"; tone="ok";
+      why=outs+" outs plus fold equity. You can win now or hit later — two ways to win."; }
+    else if(eq>fair*1.15){ verdict="CHECK"; tone="ok";
+      why="Ahead of average but thin. Keep the pot small and see the next card cheaply."; }
+    else { verdict="CHECK — plan to fold"; tone="bad";
+      why="Weak holding. Take the free card, release to any real bet."; }
+  }
+  if(G.mode==="nl"&&canRaise(i)&&/BET|RAISE/.test(verdict)){
+    const o=raiseOptions(i); const pick=eq>0.8? (o[2]||o[1]||o[0]) : (o[1]||o[0]);
+    if(pick) verdict+=" · "+pick.label;
+  }
+  return {rows,verdict,why,tone};
+}
 function coachLine(i){
   const p=G.players[i];
   if(!p.hole.length) return "";
@@ -934,6 +1108,8 @@ function mjPrivateFor(token){
 
 /* ================= STATE BROADCAST (SSE) ================= */
 let clients=[]; // {res, token|null(host)}
+const KA_MS=20000;      // SSE heartbeat
+const GRACE_MS=90000;   // stay "online" this long after a phone drops (app switch / screen lock)
 function publicState(){
   return {
     phase:G.phase, stage:G.stage, board:G.board, pot:potTotal(),
@@ -957,7 +1133,7 @@ function privateFor(token){
   const myTurn = G.phase==="play" && !G.handOver && G.turn===i && p.inHand && !p.folded && !p.allIn && p.need;
   const owe=Math.max(0,G.curBet-p.bet);
   return {
-    seat:i, hole:p.hole, coach:coachLine(i), yourTurn:myTurn,
+    seat:i, hole:p.hole, coach:coachLine(i), coachAdv:coachAdv(i), yourTurn:myTurn,
     actions: myTurn ? {
       canFold: owe>0,
       callLabel: owe<=0 ? "Check" : (owe>=p.chips ? "All-in "+p.chips : "Call "+owe),
@@ -1009,14 +1185,26 @@ const server=http.createServer(async (req,res)=>{
   if(path==="/join"){ res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"}); return res.end(PLAYER_HTML); }
 
   if(path==="/events"){
-    res.writeHead(200,{"Content-Type":"text/event-stream","Cache-Control":"no-cache","Connection":"keep-alive"});
+    res.writeHead(200,{"Content-Type":"text/event-stream","Cache-Control":"no-cache",
+      "Connection":"keep-alive","X-Accel-Buffering":"no"});
     const token=url.searchParams.get("token")||null;
     const c={res,token};
     clients.push(c);
-    const p=G.players.find(x=>x.token===token); if(p) p.connected=true;
+    const p=G.players.find(x=>x.token===token);
+    if(p){ if(p.offTimer){ clearTimeout(p.offTimer); p.offTimer=null; } p.connected=true; }
     sendTo(c); if(p) broadcast();
-    req.on("close",()=>{ clients=clients.filter(x=>x!==c);
-      const q=G.players.find(x=>x.token===token); if(q){ q.connected=false; broadcast(); } });
+    // heartbeat: keeps proxies (Render/nginx) from killing an idle stream
+    c.ka=setInterval(()=>{ try{ res.write(":ka\n\n"); }catch(e){} }, KA_MS);
+    req.on("close",()=>{ clients=clients.filter(x=>x!==c); clearInterval(c.ka);
+      const q=G.players.find(x=>x.token===token);
+      if(!q) return;
+      if(clients.some(x=>x.token===token)) return;      // another tab still open
+      if(q.offTimer) clearTimeout(q.offTimer);
+      // GRACE: phone backgrounded / screen locked -> stay seated, don't flip offline
+      q.offTimer=setTimeout(()=>{ q.offTimer=null;
+        if(!clients.some(x=>x.token===token)){ q.connected=false; broadcast(); }
+      }, GRACE_MS);
+    });
     return;
   }
 
@@ -1302,10 +1490,80 @@ table.st td{padding:8px 9px;border-bottom:1px solid var(--line);}
 .hidden{display:none!important;}
 `;
 
+/* ===== shared PORTAL (identical on TV and on every phone) ===== */
+const PORTAL_CSS=`
+.lobbyGrid{display:grid;grid-template-columns:270px 1fr;gap:24px;align-items:start;}
+@media(max-width:700px){.lobbyGrid{grid-template-columns:1fr;gap:16px;}}
+.qrBox{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px;text-align:center;}
+.qrBox #qr2{display:flex;justify-content:center;margin:8px 0;}
+.qrBox .url{font-size:1rem;font-weight:700;word-break:break-all;}
+.pl{list-style:none;} .pl li{padding:10px 4px;border-bottom:1px solid var(--line);font-size:1rem;display:flex;gap:8px;align-items:center;}
+.av{width:26px;height:26px;border-radius:50%;background:#e4ddc9 center/cover no-repeat;display:inline-block;border:1px solid var(--line);flex:none;}
+.gameCards{display:flex;gap:18px;flex-wrap:wrap;margin:16px 0;}
+.gameCard{flex:1;min-width:200px;background:#fff;border:2px solid var(--line);border-radius:16px;padding:26px 20px;text-align:center;cursor:pointer;transition:.15s;}
+.gameCard:hover{border-color:var(--gold);transform:translateY(-2px);}
+.gameCard.on{border-color:var(--felt);box-shadow:inset 0 0 0 2px var(--felt);}
+.gameCard .big{font-size:2.4rem;}
+.gameCard h2{font-size:1.35rem;margin:8px 0 4px;}
+.gameCard .gcsub{color:var(--mut);font-size:.8rem;}
+.gameCard .live{display:inline-block;margin-top:7px;font-size:.68rem;letter-spacing:.1em;background:var(--felt);color:#fff;border-radius:6px;padding:2px 8px;}
+`;
+const PORTAL_BODY=`
+  <h1 class="disp">盧家遊樂園 · Lu Family Game Portal</h1>
+  <div class="sub" id="portalSub"></div>
+  <div class="lobbyGrid">
+    <div class="qrBox">
+      <div style="font-size:.8rem;color:var(--mut)">Scan to join · 掃碼入座</div>
+      <div id="qr2"></div>
+      <div class="url" id="joinUrl2"></div>
+    </div>
+    <div>
+      <h3 class="disp">已入座 Players</h3>
+      <ul class="pl" id="portalList"></ul>
+      <div class="gameCards">
+        <div class="gameCard" id="gcPoker" onclick="api('/api/portal',{game:'poker'})">
+          <div class="big">🃏</div><h2>德州撲克</h2>
+          <div class="gcsub">Family Hold'em · 2–5人 · AI 補位</div>
+          <div class="live hidden" id="gcPokerLive">進行中 LIVE</div>
+        </div>
+        <div class="gameCard" id="gcMahjong" onclick="api('/api/portal',{game:'mahjong'})">
+          <div class="big">🀄</div><h2>台灣麻將</h2>
+          <div class="gcsub">十六張 · 4人 · 電腦補位 · 底＋台計分</div>
+          <div class="live hidden" id="gcMahjongLive">進行中 LIVE</div>
+        </div>
+      </div>
+    </div>
+  </div>
+`;
+const PORTAL_JS=`
+const joinUrl2=location.origin+"/join";
+document.getElementById("joinUrl2").textContent=joinUrl2;
+try{ new QRCode(document.getElementById("qr2"),{text:joinUrl2,width:190,height:190}); }
+catch(e){ document.getElementById("qr2").innerHTML='<div style="font-size:.8rem;color:#a3542e">No internet for QR lib — type the URL below into each phone.</div>'; }
+function pEsc(t){ return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function renderPortal(){
+  const list=(S&&S.roster&&S.roster.length)? S.roster : ((S&&S.players)||[]).filter(function(p){return !p.isAI;});
+  document.getElementById("portalList").innerHTML= list.length
+    ? list.map(function(p){ return '<li>'+(p.avatar?'<span class="av" style="background-image:url('+p.avatar+')"></span>':'\u{1F4F1}')
+        +' '+pEsc(p.name)+(p.connected===false?' <span class="badge off">offline</span>':'')+'</li>'; }).join("")
+    : '<li style="color:var(--mut)">Waiting for phones\u2026</li>';
+  const g=(typeof GAME==="undefined")?null:GAME;
+  document.getElementById("gcPoker").classList.toggle("on",g==="poker");
+  document.getElementById("gcMahjong").classList.toggle("on",g==="mahjong");
+  document.getElementById("gcPokerLive").classList.toggle("hidden",g!=="poker");
+  document.getElementById("gcMahjongLive").classList.toggle("hidden",g!=="mahjong");
+  document.getElementById("portalSub").textContent =
+    g==="poker" ? "德州撲克進行中 — 切到 3 · 牌桌繼續"
+    : g==="mahjong" ? "台灣麻將進行中 — 切到 3 · 牌桌繼續"
+    : "手機掃碼入座 — 全家同一個入口，在這裡選遊戲";
+}
+`;
+
 /* ================= HOST (TV) PAGE ================= */
 const HOST_HTML=`<!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>盧家遊樂園 · Lu Family Portal</title>
-<style>${CSS}
+<style>${CSS}${PORTAL_CSS}
+.qrBox #qr,.qrBox #qr3{display:flex;justify-content:center;margin:8px 0;}
 .wrap{max-width:1100px;margin:0 auto;padding:18px 16px;}
 .card{width:55px;height:79px;font-size:1.3rem;border-radius:7px;}
 .card .s{font-size:1.2rem;}
@@ -1397,33 +1655,28 @@ border-radius:13px;padding:8px 9px;box-shadow:0 3px 10px rgba(0,0,0,.18);}
 .mjSeat .hd .sc{margin-left:auto;} .mjSeat .lb{font-size:.56rem;color:var(--mut);letter-spacing:.12em;margin:5px 0 2px;}
 .mjSeat .tstrip{display:flex;gap:2px;flex-wrap:wrap;}
 .mjCenter{grid-column:2;grid-row:2;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#eef2ec;text-align:center;gap:3px;}
+/* ---- layer toggle ---- */
+.layerBar{display:flex;gap:9px;align-items:center;margin:0 0 12px;flex-wrap:wrap;}
+.layerBar .lbl{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);}
+.lpill{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;}
+.lpill button{border:0;background:#fff;padding:8px 14px;font-size:.85rem;cursor:pointer;color:var(--mut);}
+.lpill button.on{background:var(--felt);color:#fff;}
+.lpill button:disabled{opacity:.4;cursor:not-allowed;}
+.layerBar .peek{font-size:.72rem;color:var(--warn);}
 </style></head><body><div class="wrap">
 
-<div id="portal">
-  <h1 class="disp">盧家遊樂園 · Lu Family Game Portal</h1>
-  <div class="sub">手機掃碼入座 — 全家同一個入口，在這裡選遊戲</div>
-  <div class="lobbyGrid">
-    <div class="qrBox">
-      <div style="font-size:.8rem;color:var(--mut)">Scan to join · 掃碼入座</div>
-      <div id="qr2"></div>
-      <div class="url" id="joinUrl2"></div>
-    </div>
-    <div>
-      <h3 class="disp">已入座 Players</h3>
-      <ul class="pl" id="portalList"><li style="color:var(--mut)">Waiting for phones…</li></ul>
-      <div class="gameCards">
-        <div class="gameCard" onclick="api('/api/portal',{game:'poker'})">
-          <div class="big">🃏</div><h2>德州撲克</h2>
-          <div class="gcsub">Family Hold'em · 2–5人 · AI 補位</div>
-        </div>
-        <div class="gameCard" onclick="api('/api/portal',{game:'mahjong'})">
-          <div class="big">🀄</div><h2>台灣麻將</h2>
-          <div class="gcsub">十六張 · 4人 · 電腦補位 · 底＋台計分</div>
-        </div>
-      </div>
-    </div>
+<div class="layerBar">
+  <span class="lbl">畫面 View</span>
+  <div class="lpill">
+    <button id="L1" onclick="setView(1)">1 · 大廳</button>
+    <button id="L2" onclick="setView(2)">2 · 設定</button>
+    <button id="L3" onclick="setView(3)">3 · 牌桌</button>
   </div>
+  <button class="miniBtn" onclick="setView(0)">Auto</button>
+  <span class="peek hidden" id="peekLbl">手動檢視中 — 牌局照常進行</span>
 </div>
+
+<div id="portal">${PORTAL_BODY}</div>
 
 <div id="lobby">
   <h1 class="disp">Family Hold'em <button class="tbtn" style="vertical-align:middle" onclick="api('/api/portal',{game:null})">← 回大廳</button></h1>
@@ -1554,25 +1807,44 @@ function api(u,b){return fetch(u,{method:"POST",headers:{"Content-Type":"applica
 function startGame(){ api("/api/start",{stack:parseInt(pv("pillStack")),ai:parseInt(pv("pillAI")),
   mode:pv("pillMode"),blinds:pv("pillBlinds"),skill:pv("pillSkill")}); }
 
-let S=null,GAME=null;
-const es=new EventSource("/events");
-es.onmessage=e=>{ const d=JSON.parse(e.data); GAME=d.game; S=d.pub; render(); };
+let S=null,GAME=null,es=null,esRetry=null;
+let VIEW=0, lastAuto=0;   // VIEW 0 = auto-follow the server
+function openES(){
+  if(es){ try{ es.close(); }catch(e){} }
+  es=new EventSource("/events");
+  es.onerror=function(){ if(esRetry) return;
+    esRetry=setTimeout(function(){ esRetry=null; openES(); },2000); };
+  es.onmessage=e=>{ const d=JSON.parse(e.data); GAME=d.game; S=d.pub; render(); };
+}
+openES();
+setInterval(function(){ if(!es||es.readyState===2) openES(); },5000);
+document.addEventListener("visibilitychange",function(){ if(!document.hidden&&(!es||es.readyState===2)) openES(); });
+function setView(n){ VIEW=n; render(); }
+function autoLayer(){
+  if(GAME===null||GAME===undefined) return 1;
+  if(GAME==="mahjong") return (S&&S.phase==="play")?3:2;
+  return (S&&S.phase==="lobby")?2:3;
+}
 function render(){
-  const isPortal=(GAME===null||GAME===undefined);
-  document.getElementById("portal").classList.toggle("hidden",!isPortal);
-  const mjOn=GAME==="mahjong";
-  document.getElementById("mjLobby").classList.toggle("hidden",!(mjOn&&S.phase!=="play"));
-  document.getElementById("mjGame").classList.toggle("hidden",!(mjOn&&S.phase==="play"));
-  if(isPortal||mjOn){
-    document.getElementById("lobby").classList.add("hidden");
-    document.getElementById("game").classList.add("hidden");
-    if(isPortal) renderPortal(); else renderMJ();
-    return;
-  }
-  const lobby=S.phase==="lobby";
-  document.getElementById("lobby").classList.toggle("hidden",!lobby);
-  document.getElementById("game").classList.toggle("hidden",lobby);
-  if(lobby){
+  const noGame=(GAME===null||GAME===undefined), mjOn=(GAME==="mahjong");
+  const auto=autoLayer();
+  if(auto!==lastAuto){ lastAuto=auto; VIEW=0; }   // real state change wins over a manual peek
+  let L=VIEW||auto;
+  if(noGame) L=1;                                  // no game picked -> only layer 1 exists
+  if(L===3&&!mjOn&&S&&S.phase==="lobby") L=2;      // no table dealt yet
+  if(L===3&&mjOn&&S&&S.phase!=="play") L=2;
+  const l3ok=(!noGame)&&(mjOn? S.phase==="play" : S.phase!=="lobby");
+  ["L1","L2","L3"].forEach((id,k)=>{ const b=document.getElementById(id);
+    b.classList.toggle("on",L===k+1); b.disabled=(k>0&&noGame)||(k===2&&!l3ok); });
+  document.getElementById("peekLbl").classList.toggle("hidden",L===auto);
+  document.getElementById("portal").classList.toggle("hidden",L!==1);
+  document.getElementById("lobby").classList.toggle("hidden",!(L===2&&!mjOn&&!noGame));
+  document.getElementById("game").classList.toggle("hidden",!(L===3&&!mjOn&&!noGame));
+  document.getElementById("mjLobby").classList.toggle("hidden",!(L===2&&mjOn));
+  document.getElementById("mjGame").classList.toggle("hidden",!(L===3&&mjOn));
+  if(L===1){ renderPortal(); return; }
+  if(mjOn){ renderMJ(); return; }
+  if(L===2){
     const ul=document.getElementById("lobbyList");
     ul.innerHTML=S.players.length? S.players.map(p=>'<li>'+(p.avatar?'<span class="av" style="background-image:url('+p.avatar+')"></span>':'📱')+' '+esc(p.name)
       +(p.connected?'':' <span class="badge off">offline</span>')
@@ -1647,9 +1919,8 @@ function openStats(){
 }
 function closeStats(){document.getElementById("statsPanel").classList.add("hidden");}
 /* ---- portal + mahjong (host) ---- */
-document.getElementById("joinUrl2").textContent=joinUrl;
-try{ new QRCode(document.getElementById("qr2"),{text:joinUrl,width:190,height:190}); }catch(e){}
 try{ new QRCode(document.getElementById("qr3"),{text:joinUrl,width:150,height:150}); }catch(e){}
+${PORTAL_JS}
 const MJN=["一","二","三","四","五","六","七","八","九"],MJH=["東","南","西","北","中","發","白"],MJF=["春","夏","秋","冬","梅","蘭","菊","竹"];
 function _dots(n){var L={1:[[17,24,7]],2:[[17,14,5.2],[17,34,5.2]],3:[[9,12,5],[17,24,5],[25,36,5]],4:[[11,14,5],[23,14,5],[11,34,5],[23,34,5]],5:[[11,13,4.6],[23,13,4.6],[17,24,4.6],[11,35,4.6],[23,35,4.6]],6:[[11,12,4.3],[23,12,4.3],[11,24,4.3],[23,24,4.3],[11,36,4.3],[23,36,4.3]],7:[[9,11,3.9],[17,11,3.9],[25,11,3.9],[13,24,3.9],[21,24,3.9],[13,37,3.9],[21,37,3.9]],8:[[9,11,3.7],[17,11,3.7],[25,11,3.7],[9,24,3.7],[25,24,3.7],[9,37,3.7],[17,37,3.7],[25,37,3.7]],9:[[9,11,3.7],[17,11,3.7],[25,11,3.7],[9,24,3.7],[17,24,3.7],[25,24,3.7],[9,37,3.7],[17,37,3.7],[25,37,3.7]]};return L[n]||L[1];}
 function tsvg(t){
@@ -1669,12 +1940,6 @@ function mtile(t,sm,extra){
   var c=(sm?"mtile sm":"mtile")+(extra||"");
   if(t===null||t===undefined) return '<div class="'+c+' back"></div>';
   return '<div class="'+c+'">'+tsvg(t)+'</div>';
-}
-function renderPortal(){
-  const ul=document.getElementById("portalList");
-  const hum=(S.players||[]).filter(p=>!p.isAI);
-  ul.innerHTML=hum.length? hum.map(p=>'<li>'+(p.avatar?'<span class="av" style="background-image:url('+p.avatar+')"></span>':'📱')+' '+esc(p.name)+(p.connected?'':' <span class="badge off">offline</span>')+'</li>').join("")
-    :'<li style="color:var(--mut)">Waiting for phones…</li>';
 }
 function mjStart(){ api("/api/mj/start",{base:parseInt(pv("pillBase")),tai:parseInt(pv("pillTai"))}); }
 function mjAuto(s){ api("/api/mj/auto",{seat:s}); }
@@ -1760,7 +2025,7 @@ function renderMJ(){
 /* ================= PLAYER (PHONE) PAGE ================= */
 const PLAYER_HTML=`<!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"><title>盧家遊樂園 — 我的牌</title>
-<style>${CSS}
+<style>${CSS}${PORTAL_CSS}
 .wrap{max-width:440px;margin:0 auto;padding:16px 14px 30px;}
 h1{font-size:1.3rem;} .sub{color:var(--mut);font-size:.78rem;margin:2px 0 16px;}
 input[type=text]{width:100%;padding:13px;border:1px solid var(--line);border-radius:10px;font-size:1.05rem;background:#fff;}
@@ -1821,6 +2086,26 @@ body.mj .wrap{max-width:980px;}
 .mMini{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;font-size:.72rem;color:var(--mut);}
 .waitsLn{font-size:.82rem;color:var(--ok);margin-top:5px;min-height:1.1em;font-weight:600;}
 #mjPlay.rot{position:fixed;top:0;left:0;width:100vh;height:100vw;transform:translateX(100vw) rotate(90deg);transform-origin:top left;overflow:auto;background:var(--cream);padding:8px 12px;z-index:60;}
+/* ---- bottom layer toggle (phone) ---- */
+body{padding-bottom:74px;}
+#pBar{position:fixed;left:0;right:0;bottom:0;z-index:70;background:var(--cream);
+border-top:1px solid var(--line);padding:8px 10px calc(8px + env(safe-area-inset-bottom));
+display:flex;gap:8px;align-items:center;justify-content:center;box-shadow:0 -3px 12px rgba(0,0,0,.10);}
+#pBar .lpill{display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;flex:1;max-width:330px;}
+#pBar .lpill button{flex:1;border:0;background:#fff;padding:11px 4px;font-size:.86rem;cursor:pointer;color:var(--mut);}
+#pBar .lpill button.on{background:var(--felt);color:#fff;font-weight:700;}
+#pBar .lpill button:disabled{opacity:.35;}
+#pBar .auto{border:1px solid var(--line);background:#fff;border-radius:9px;padding:11px 12px;font-size:.78rem;color:var(--mut);}
+/* ---- advanced coach ---- */
+.cRow{display:flex;gap:8px;font-size:.82rem;padding:3px 0;border-bottom:1px dashed var(--line);}
+.cRow:last-of-type{border-bottom:0;}
+.cRow .k{color:var(--mut);min-width:74px;flex:none;letter-spacing:.03em;}
+.cRow .v{color:var(--ink);font-weight:600;}
+.cVer{margin-top:9px;font-size:1.02rem;font-weight:800;letter-spacing:.02em;}
+.cVer.good{color:#1e6b3c;} .cVer.ok{color:#8a5a18;} .cVer.bad{color:#8c2f2f;}
+.cWhy{margin-top:3px;font-size:.8rem;color:var(--mut);line-height:1.45;}
+.eqBar{height:7px;border-radius:4px;background:#e4ddc9;overflow:hidden;margin:7px 0 2px;}
+.eqBar i{display:block;height:100%;background:var(--felt);}
 </style></head><body><div class="wrap">
 
 <div id="join">
@@ -1866,7 +2151,7 @@ body.mj .wrap{max-width:980px;}
   </div>
   <div class="raiseRow" id="raiseRow"></div>
   <div class="bar">
-    <button class="tbtn" id="btnCoach" onclick="coachOn=!coachOn;paint()">Coach: On</button>
+    <button class="tbtn" id="btnCoach" onclick="cycleCoach()">Coach</button>
     <button class="tbtn" onclick="transfer()">Send chips</button>
     <button class="tbtn" style="color:#8c2f2f" onclick="leaveTable()">Leave table</button>
   </div>
@@ -1874,11 +2159,26 @@ body.mj .wrap{max-width:980px;}
   <input type="file" id="avFile" accept="image/*" class="hidden">
 </div>
 
-<div id="portalWait" class="hidden">
-  <h1 class="disp">已入座 ✓</h1>
-  <div class="sub">看電視大螢幕 — 等主持人選遊戲…</div>
-  <div class="statusCard"><div class="row"><b id="pwName"></b><span id="pwCount" style="color:var(--mut)"></span></div></div>
-  <div class="bar"><button class="tbtn" style="color:#8c2f2f" onclick="leaveTable()">離座 Leave</button></div>
+<div id="portalWait" class="hidden">${PORTAL_BODY}</div>
+
+<div id="pSeat" class="hidden">
+  <h1 class="disp">我的座位</h1>
+  <div class="sub">名字、照片、教練程度 — 隨時可改，牌局照常進行</div>
+  <div class="statusCard">
+    <div class="row">
+      <span style="display:flex;align-items:center;gap:9px">
+        <span class="av" id="sAv" onclick="pickAv()" title="Tap to set your photo">👤</span>
+        <b id="sName"></b> <button class="editBtn" onclick="rename()">✎</button>
+      </span>
+      <span id="sChips" style="color:var(--mut)"></span>
+    </div>
+  </div>
+  <div class="bar" style="margin-top:10px;flex-wrap:wrap">
+    <button class="tbtn" id="btnCoach2" onclick="cycleCoach()">Coach</button>
+    <button class="tbtn" onclick="transfer()">Send chips</button>
+    <button class="tbtn" style="color:#8c2f2f" onclick="leaveTable()">Leave table 離座</button>
+  </div>
+  <div class="sub" id="sHint" style="margin-top:10px"></div>
 </div>
 
 <div id="mjPlay" class="hidden">
@@ -1901,6 +2201,16 @@ body.mj .wrap{max-width:980px;}
 </div>
 
 </div>
+
+<div id="pBar" class="hidden">
+  <div class="lpill">
+    <button id="P1" onclick="pView(1)">1 · 大廳</button>
+    <button id="P2" onclick="pView(2)">2 · 座位</button>
+    <button id="P3" onclick="pView(3)">3 · 牌桌</button>
+  </div>
+  <button class="auto" onclick="pView(0)">Auto</button>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
 const SUITS=["♠","♥","♦","♣"],RN={11:"J",12:"Q",13:"K",14:"A"};
 const rN=r=>RN[r]||String(r);
@@ -1919,25 +2229,82 @@ async function join(){
   localStorage.setItem("pk_token",token); localStorage.setItem("pk_name",myName);
   connect();
 }
+/* ---- stay-online: reconnect after app switch / screen lock ---- */
+let esRetry=null, wakeLock=null;
+async function keepAwake(){
+  try{ if("wakeLock" in navigator && (!wakeLock||wakeLock.released))
+    wakeLock=await navigator.wakeLock.request("screen"); }catch(e){}
+}
+function esDead(){ return !es || es.readyState===2; }
+function reconnect(){ if(!token) return; if(!esDead()) return; openES(); }
+document.addEventListener("visibilitychange",function(){ if(!document.hidden){ reconnect(); keepAwake(); } });
+window.addEventListener("pageshow",reconnect);
+window.addEventListener("focus",reconnect);
+window.addEventListener("online",reconnect);
+setInterval(reconnect,5000);
+
 function connect(){
   document.getElementById("join").classList.add("hidden");
+  openES(); keepAwake();
+}
+function openES(){
+  if(es){ try{ es.close(); }catch(e){} }
   es=new EventSource("/events?token="+token);
-  es.onmessage=e=>{const d=JSON.parse(e.data); GAME=d.game; S=d.pub;
-    document.body.classList.toggle("mj",GAME==="mahjong");
-    document.getElementById("portalWait").classList.toggle("hidden",!(GAME===null||GAME===undefined));
-    document.getElementById("play").classList.toggle("hidden",GAME!=="poker");
-    document.getElementById("mjPlay").classList.toggle("hidden",GAME!=="mahjong");
-    if(GAME==="poker"){
-      if(!d.me){ document.getElementById("waitLine").textContent="You've been removed from the table.";
-        document.getElementById("pubLine").textContent="Ask the host to end the session if you want to rejoin."; return; }
-      ME=d.me; paint();
-    } else if(GAME==="mahjong"){
-      MJME=d.me;
-      if(!MJME||!MJME.myTurn) mjSel=null;
-      if(localStorage.getItem("mj_rot")==="1") document.getElementById("mjPlay").classList.add("rot");
-      mjPaint();
-    } else paintPortal();
-  };
+  es.onerror=function(){ if(esRetry) return;
+    esRetry=setTimeout(function(){ esRetry=null; openES(); },2000); };
+  es.onmessage=e=>{const d=JSON.parse(e.data); GAME=d.game; S=d.pub; MEIN=d.me; pRender(); };
+}
+let PV=0, pLastAuto="", MEIN=null;
+function pView(n){ PV=n; pRender(); }
+function coachLvl(){ return localStorage.getItem("pk_coach")||"adv"; }
+function cycleCoach(){
+  const order=["adv","basic","off"], i=order.indexOf(coachLvl());
+  localStorage.setItem("pk_coach",order[(i+1)%3]); pRender();
+}
+function coachLabel(){ return "Coach: "+({adv:"進階 Advanced",basic:"教學 Basic",off:"Off"}[coachLvl()]); }
+function pRender(){
+  if(!S) return;
+  const noGame=(GAME===null||GAME===undefined);
+  const auto=noGame?1:3;
+  const akey=(GAME||"none")+"|"+auto;
+  if(akey!==pLastAuto){ pLastAuto=akey; PV=0; }   // game starts/ends/changes -> snap back
+  let L=PV||auto;
+  if(noGame&&L===3) L=1;
+  document.body.classList.toggle("mj",GAME==="mahjong"&&L===3);
+  document.getElementById("pBar").classList.remove("hidden");
+  ["P1","P2","P3"].forEach(function(id,k){ const b=document.getElementById(id);
+    b.classList.toggle("on",L===k+1); b.disabled=(k===2&&noGame); });
+  document.getElementById("portalWait").classList.toggle("hidden",L!==1);
+  document.getElementById("pSeat").classList.toggle("hidden",L!==2);
+  document.getElementById("play").classList.toggle("hidden",!(L===3&&GAME==="poker"));
+  document.getElementById("mjPlay").classList.toggle("hidden",!(L===3&&GAME==="mahjong"));
+  document.getElementById("btnCoach").textContent=coachLabel();
+  renderPortal(); paintSeat();
+  if(GAME==="poker"){
+    if(!MEIN){ document.getElementById("waitLine").textContent="You've been removed from the table.";
+      document.getElementById("pubLine").textContent="Ask the host to end the session if you want to rejoin."; return; }
+    ME=MEIN; if(L===3) paint();
+  } else if(GAME==="mahjong"){
+    MJME=MEIN;
+    if(!MJME||!MJME.myTurn) mjSel=null;
+    if(localStorage.getItem("mj_rot")==="1") document.getElementById("mjPlay").classList.add("rot");
+    if(L===3) mjPaint();
+  }
+}
+function paintSeat(){
+  document.getElementById("sName").textContent=myName||"";
+  let chips="", av=null;
+  if(GAME==="poker"&&ME&&S.players&&S.players[ME.seat]){
+    const p=S.players[ME.seat]; chips="🪙 "+p.chips; av=p.avatar;
+  } else if(GAME==="mahjong"&&MJME){ chips="分數 "+(MJME.score||0); }
+  document.getElementById("sChips").textContent=chips;
+  const a=document.getElementById("sAv");
+  if(av){ a.style.backgroundImage="url("+av+")"; a.textContent=""; }
+  document.getElementById("btnCoach2").textContent=coachLabel();
+  document.getElementById("sHint").textContent=
+    coachLvl()==="adv" ? "進階教練：勝率、賠率、outs、位置、SPR — 每一步都給數字和理由。"
+    : coachLvl()==="basic" ? "教學模式：一句話白話建議，適合新手。"
+    : "教練已關閉。";
 }
 function transfer(){
   if(!S||!ME) return;
@@ -1965,6 +2332,16 @@ function rename(){
 function act(a,to){
   fetch("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({token,action:a,to})}).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);});
+}
+function pesc(t){ return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function advHTML(a){
+  let eq=0; a.rows.forEach(function(r){ if(r[0]==="Equity") eq=parseInt(r[1],10)||0; });
+  let h='<div class="eqBar"><i style="width:'+Math.max(2,Math.min(100,eq))+'%"></i></div>';
+  a.rows.forEach(function(r){
+    h+='<div class="cRow"><span class="k">'+pesc(r[0])+'</span><span class="v">'+pesc(r[1])+'</span></div>'; });
+  h+='<div class="cVer '+pesc(a.tone)+'">'+pesc(a.verdict)+'</div>';
+  h+='<div class="cWhy">'+pesc(a.why)+'</div>';
+  return h;
 }
 function paint(){
   if(!S||!ME) return;
@@ -2003,10 +2380,13 @@ function paint(){
     bR.disabled=!(A&&A.canRaise); bR.textContent=A?A.raiseLabel:"Raise";
   }
   const cb=document.getElementById("coachBox");
-  const showCoach=coachOn&&ME.coach&&!p.folded&&S.phase==="play"&&!S.handOver;
-  cb.classList.toggle("hidden",!showCoach);
-  cb.textContent=ME.coach||"";
-  document.getElementById("btnCoach").textContent="Coach: "+(coachOn?"On":"Off");
+  const lvl=coachLvl();
+  const live=!p.folded&&S.phase==="play"&&!S.handOver;
+  if(!live||lvl==="off"){ cb.classList.add("hidden"); }
+  else if(lvl==="adv"&&ME.coachAdv){ cb.classList.remove("hidden"); cb.innerHTML=advHTML(ME.coachAdv); }
+  else if(ME.coach){ cb.classList.remove("hidden"); cb.textContent=ME.coach; }
+  else cb.classList.add("hidden");
+  document.getElementById("btnCoach").textContent=coachLabel();
   document.getElementById("pubLine").textContent=S.banner||"";
 }
 function leaveTable(){
@@ -2062,12 +2442,9 @@ function mtile(t,sm,extra){
   if(t===null||t===undefined) return '<div class="'+c+' back"></div>';
   return '<div class="'+c+'">'+tsvg(t)+'</div>';
 }
-function paintPortal(){
-  const me=(S.players||[]).find(function(p){return p.name===myName;});
-  document.getElementById("pwName").textContent=myName||(me?me.name:"");
-  const n=(S.players||[]).filter(function(p){return !p.isAI;}).length;
-  document.getElementById("pwCount").textContent="目前 "+n+" 人入座";
-}
+function api(u,b){ return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(b||{})}).then(function(r){return r.json();}).then(function(j){ if(j.error) alert(j.error); return j; }); }
+${PORTAL_JS}
 function mjPost(u,b){ b.token=token;
   fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})
     .then(function(r){return r.json();}).then(function(j){ if(j.error) alert(j.error); });
