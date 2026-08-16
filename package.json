@@ -1,15 +1,21 @@
 {
-  "name": "lu-family-portal",
-  "version": "1.0.0",
-  "private": true,
-  "engines": {
-    "node": ">=18"
-  },
+  "name": "dalaoer",
+  "version": "1.9.0",
+  "description": "大老二 (Big Two) — 盧家遊戲入口模組",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node lu_family_portal.js"
+    "start": "node src/server.js",
+    "test": "node test/engine.test.js && node test/v15.test.js && node test/challenge.test.js && node test/mount.test.js && node test/guards.test.js",
+    "e2e": "node test/e2e_inproc.js",
+    "sim": "node test/simulate.js"
   },
   "dependencies": {
-    "express": "^5.2.1",
-    "socket.io": "^4.8.3"
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "socket.io-client": "^4.8.3"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
   }
 }
