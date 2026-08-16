@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#162925">
+<title>大老二 · 盧家遊戲</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ─────────── 進入畫面 ─────────── -->
+<section id="screen-lobby" class="screen active">
+  <header class="brand">
+    <div class="brand-mark">貳</div>
+    <h1>大老二</h1>
+    <p class="brand-sub">盧家遊戲</p>
+  </header>
+
+  <div class="panel" id="panel-entry">
+    <label class="field">
+      <span>你的名字</span>
+      <input id="input-name" type="text" maxlength="8" placeholder="輸入名字" autocomplete="off">
+    </label>
+    <button class="btn btn-primary" id="btn-create">開新房間</button>
+    <div class="divider"><span>或</span></div>
+    <label class="field">
+      <span>房間代碼</span>
+      <input id="input-code" type="text" maxlength="4" placeholder="四個字" autocomplete="off">
+    </label>
+    <button class="btn" id="btn-join">加入房間</button>
+  </div>
+
+  <div class="panel hidden" id="panel-room">
+    <div class="room-code">
+      <span class="room-code-label">房間代碼</span>
+      <strong id="room-code-value">----</strong>
+    </div>
+
+    <ul class="seat-list" id="seat-list"></ul>
+
+    <div class="settings" id="settings">
+      <h2>設定</h2>
+
+      <div class="setting">
+        <div class="setting-text"><strong>玩法</strong><em>盧家玩法多了換牌和對賭</em></div>
+        <div class="segmented" data-key="luMode">
+          <button data-value="false" class="on">標準</button>
+          <button data-value="true">盧家</button>
+        </div>
+      </div>
+
+      <div class="setting">
+        <div class="setting-text"><strong>出牌檢查</strong><em>嚴格模式會自動擋掉不合法的牌</em></div>
+        <div class="segmented" data-key="strictMode">
+          <button data-value="true" class="on">嚴格</button>
+          <button data-value="false">寬鬆</button>
+        </div>
+      </div>
+
+      <div class="setting">
+        <div class="setting-text"><strong>一分多少錢</strong><em>剩幾張牌就算幾分</em></div>
+        <div class="stepper" data-key="pointValue">
+          <button data-delta="-1">−</button>
+          <output id="point-value">5</output>
+          <button data-delta="1">＋</button>
+        </div>
+      </div>
+    </div>
+
+    <p class="hint" id="host-hint">空位會由電腦補上。</p>
+    <button class="btn btn-primary" id="btn-start">開始</button>
+  </div>
+
+  <!-- 座位確認：發牌之前一定會經過這裡 -->
+  <div class="panel hidden" id="panel-seating">
+    <h1 class="seating-title">確認座位</h1>
+    <p class="hint">用 ◀ ▶ 把每個人挪到他真正坐的位子。<br>按下確認才會發牌。</p>
+    <div class="seating-list" id="seating-list"></div>
+    <button class="btn btn-primary btn-big" id="btn-confirm-seats">座位沒錯，開始發牌</button>
+  </div>
+</section>
+
+<!-- ─────────── 牌桌 ─────────── -->
+<section id="screen-game" class="screen">
+  <div class="pause hidden" id="pause"></div>
+  <div class="proposal hidden" id="proposal"></div>
+  <div class="table">
+    <div class="opponents" id="opponents"></div>
+
+    <div class="waiting hidden" id="waiting"></div>
+    <div class="challenge hidden" id="challenge"></div>
+    <div class="dice hidden" id="dice"></div>
+    <div class="history hidden" id="history"></div>
+    <div class="provisional hidden" id="provisional"></div>
+
+    <div class="center" id="center">
+      <div class="center-label" id="center-label">等待開牌</div>
+      <div class="pile" id="pile"></div>
+      <div class="phase-note" id="phase-note"></div>
+    </div>
+
+    <div class="me">
+      <div class="me-bar">
+        <span class="me-name" id="me-name">你</span>
+        <span class="timer" id="timer"></span>
+        <button class="btn-ghost" id="btn-ledger">本場戰績</button>
+      </div>
+      <div class="swap-mode hidden" id="swap-mode"></div>
+      <div class="sort-bar hidden" id="sort-bar"></div>
+      <div class="hand" id="hand"></div>
+      <div class="actions" id="actions"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ─────────── 覆蓋層 ─────────── -->
+<div class="overlay hidden" id="overlay">
+  <div class="sheet" id="sheet"></div>
+</div>
+
+<div class="toast-stack" id="toast-stack"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="ns.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
