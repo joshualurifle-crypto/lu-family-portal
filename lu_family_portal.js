@@ -2,17 +2,13 @@
    LU FAMILY GAME PORTAL — 盧家遊樂園（德州撲克 + 台灣麻將十六張）(zero dependencies)
    Run:   node lu_family_portal.js
    TV:    open the printed URL on the big screen  (host view)
-
    Phones: scan the QR shown on the TV            (player view)
    Fixed-limit 10/20 · blinds 5/10 · 2–5 players · AI fill
    ============================================================ */
 "use strict";
 const http = require("http");
 const os   = require("os");
-
 const crypto = require("crypto");
-   const { attach } = require('./dalaoer/src/server');
-attach(app, io, { mount: '/dalaoer' });
 const PORT = process.env.PORT || 3000;
 
 /* ================= GAME ENGINE ================= */
@@ -1185,6 +1181,9 @@ const server=http.createServer(async (req,res)=>{
   const url=new URL(req.url,"http://x");
   const path=url.pathname;
 
+  // ---- 大老二 Big Two：/dalaoer 底下的一律交給 express ----
+  if(path==="/dalaoer"||path.startsWith("/dalaoer/")) return big2(req,res);
+
   if(path==="/"){ res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"}); return res.end(HOST_HTML); }
   if(path==="/join"){ res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"}); return res.end(PLAYER_HTML); }
 
@@ -1534,6 +1533,10 @@ const PORTAL_BODY=`
           <div class="big">🀄</div><h2>台灣麻將</h2>
           <div class="gcsub">十六張 · 4人 · 電腦補位 · 底＋台計分</div>
           <div class="live hidden" id="gcMahjongLive">進行中 LIVE</div>
+        </div>
+        <div class="gameCard" id="gcBig2" onclick="location.href='/dalaoer'">
+          <div class="big">🀫</div><h2>大老二</h2>
+          <div class="gcsub">Big Two · 4人 · 電腦補位 · 盧家玩法</div>
         </div>
       </div>
     </div>
@@ -2584,6 +2587,18 @@ server.on("error",err=>{
     process.exit(1);
   }
 });
+// ============================================================
+// 大老二 Big Two — 掛在同一個 http server 上
+// express 只負責 /dalaoer，socket.io 只攔 /socket.io/，
+// 入口原本的 SSE（/events）完全不受影響。
+// ============================================================
+const express = require("express");
+const { Server: IOServer } = require("socket.io");
+const { attach } = require("./dalaoer/src/server");
+const big2 = express();
+const io = new IOServer(server);
+attach(big2, io, { mount: "/dalaoer" });
+
 if(!process.env.MJ_TEST) server.listen(activePort,"0.0.0.0");
 server.on("listening",()=>{
   const list=allIPs(); const ip=list.length?list[0].ip:"localhost";
