@@ -87,6 +87,27 @@ function readTicketFull() {
 
 // ───────────────────────────────────────── 進入畫面
 
+/**
+ * 一進頁面就先看看這台裝置上有沒有上次的座位。
+ * 有的話直接帶著 token 回去，不用重打名字和房號。
+ * 這就是斷線之後的「回來玩」——不需要另外一顆按鈕。
+ */
+(function autoRejoin() {
+  const t = readTicketFull();
+  if (!t || !t.code || !t.token) return;
+  socket.on('connect', function once() {
+    socket.off('connect', once);
+    socket.emit('joinRoom', { code: t.code, name: t.name, token: t.token }, (r) => {
+      if (!r || !r.ok) return;                 // 房間沒了就當作沒事，留在入口畫面
+      me.seat = r.seat; me.code = r.code; me.name = t.name;
+      saveTicket(r.code, r.token, t.name);
+      $('panel-entry').classList.add('hidden');
+      $('panel-room').classList.remove('hidden');
+      toast(r.resumed ? '歡迎回來，回到你原本的位子' : '已重新入座');
+    });
+  });
+}());
+
 $('btn-create').onclick = () => {
   const name = $('input-name').value.trim();
   if (!name) return toast('先輸入你的名字', true);
@@ -264,6 +285,7 @@ function renderAll() {
   renderCenter();
   renderSwapMode();
   renderSortBar();
+  renderGroups();
   renderHand();
   renderActions();
   renderWaiting();
@@ -438,8 +460,116 @@ function cardsToDiscard() {
   return [...selected];
 }
 
+// ───────────────────────────────────────── 分組（把組好的牌先放一邊）
+// 純粹是這台裝置上的整理，伺服器完全不知道，也不影響任何規則。
+let groups = [];   // [[card,...], ...]
+
+/** 手上已經被分進某一組的牌 */
+function groupedCards() {
+  const set = new Set();
+  groups.forEach((g) => g.forEach((c) => set.add(c)));
+  return set;
+}
+
+/** 出過的牌要從組裡拿掉；組空了就丟掉 */
+function pruneGroups() {
+  const inHand = new Set(state.hand);
+  groups = groups
+    .map((g) => g.filter((c) => inHand.has(c)))
+    .filter((g) => g.length > 0);
+}
+
+/** 把目前選的牌收成一組 */
+function makeGroup() {
+  const cards = [...selected].filter((c) => state.hand.includes(c));
+  if (cards.length < 2) return toast('至少選兩張才分得成一組', true);
+  // 這些牌如果原本在別組，先從那邊拿掉
+  groups = groups.map((g) => g.filter((c) => !cards.includes(c))).filter((g) => g.length);
+  groups.push(cards.sort((a, b) => a - b));
+  selected.clear();
+  render();
+}
+
+/** 這一組是什麼牌型（純提示，看不出來就不寫） */
+function groupLabel(cards) {
+  const m = identifyLocal(cards);
+  return m || '';
+}
+
+/** 客戶端的簡易牌型辨識，只為了在組上標個名字 */
+function identifyLocal(cards) {
+  const n = cards.length;
+  const ranks = cards.map(rankOf).sort((a, b) => a - b);
+  const suits = cards.map(suitOf);
+  const same = ranks.every((r) => r === ranks[0]);
+  if (n === 1) return '單張';
+  if (n === 2) return same ? '對子' : '';
+  if (n === 3) return same ? '三條' : '';
+  if (n !== 5) return '';
+  const flush = suits.every((x) => x === suits[0]);
+  const LADDER = [[11, 12, 0, 1, 2], [12, 0, 1, 2, 3], [0, 1, 2, 3, 4], [1, 2, 3, 4, 5],
+    [2, 3, 4, 5, 6], [3, 4, 5, 6, 7], [4, 5, 6, 7, 8], [5, 6, 7, 8, 9],
+    [6, 7, 8, 9, 10], [7, 8, 9, 10, 11]];
+  const set = new Set(ranks);
+  const straight = set.size === 5 && LADDER.some((seq) => seq.every((r) => set.has(r)));
+  if (straight && flush) return '同花順';
+  const counts = {};
+  ranks.forEach((r) => { counts[r] = (counts[r] || 0) + 1; });
+  const sizes = Object.values(counts).sort((a, b) => b - a);
+  if (sizes[0] === 4) return '鐵支';
+  if (sizes[0] === 3 && sizes[1] === 2) return '葫蘆';
+  if (flush) return '同花';
+  if (straight) return '順子';
+  return '';
+}
+
+function renderGroups() {
+  const box = $('groups');
+  if (!box) return;
+  pruneGroups();
+  if (!groups.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  box.innerHTML = '';
+
+  groups.forEach((g, gi) => {
+    const wrap = document.createElement('div');
+    const allSelected = g.every((c) => selected.has(c));
+    wrap.className = 'group' + (allSelected ? ' group-on' : '');
+
+    const head = document.createElement('div');
+    head.className = 'group-head';
+    const label = groupLabel(g);
+    head.innerHTML = `<span>${label || `${g.length} 張`}</span>`;
+    const x = document.createElement('button');
+    x.className = 'group-x';
+    x.textContent = '×';
+    x.title = '拆開這一組';
+    x.onclick = (e) => {
+      e.stopPropagation();
+      groups.splice(gi, 1);
+      render();
+    };
+    head.appendChild(x);
+
+    const row = document.createElement('div');
+    row.className = 'group-cards';
+    g.forEach((c) => row.appendChild(cardEl(c, { small: true, static: true })));
+
+    // 點整組 = 一次選起來（或一次取消）
+    wrap.onclick = () => {
+      if (allSelected) g.forEach((c) => selected.delete(c));
+      else g.forEach((c) => selected.add(c));
+      render();
+    };
+
+    wrap.append(head, row);
+    box.appendChild(wrap);
+  });
+}
+
 function sortedHand() {
-  const h = [...state.hand];
+  const inGroup = groupedCards();
+  const h = state.hand.filter((c) => !inGroup.has(c));
   if (handSort === 'suit') {
     return h.sort((a, b) => suitOf(a) - suitOf(b) || rankOf(a) - rankOf(b));
   }
@@ -483,9 +613,11 @@ function renderSortBar() {
 function renderHand() {
   const box = $('hand');
   box.innerHTML = '';
+  // 牌隨時都選得起來，不用等輪到自己——不然想趁空檔理牌、分組都做不了。
+  // 真正的限制在「出牌」那個按鈕上，伺服器也會再擋一次。
   const selectable = state.phase === 'SWAP_SELECT'
     ? !state.swap.submitted[me.seat]
-    : state.phase === 'PLAYING' && state.turn === me.seat;
+    : ['PLAYING', 'PROVISIONAL_FINISH', 'BET_DECLARE', 'BET_RESPOND'].includes(state.phase);
 
   sortedHand().forEach((c) => {
     const el = cardEl(c, { static: !selectable });
@@ -525,6 +657,7 @@ function renderActions() {
         if (!r.ok) toast(r.reason, true); else selected.clear();
       });
     });
+    if (selected.size >= 2) add('分成一組', '', makeGroup);
     if (selected.size) add('重選', '', () => { selected.clear(); render(); });
     return;
   }
@@ -595,6 +728,9 @@ function renderActions() {
   if (state.phase === 'PLAYING') {
     if (state.turn !== me.seat) {
       add(`等 ${nameOf(state.turn)} 出牌`, '', () => {}, true);
+      // 等別人的時候正好可以理牌
+      if (selected.size >= 2) add('分成一組', '', makeGroup);
+      if (selected.size) add('重選', '', () => { selected.clear(); render(); });
       return;
     }
     add(`出牌（${selected.size} 張）`, 'btn-primary', () => {
@@ -603,6 +739,7 @@ function renderActions() {
         if (!r.ok) toast(r.reason, true); else selected.clear();
       });
     }, !selected.size);
+    if (selected.size >= 2) add('分成一組', '', makeGroup);
     if (selected.size) add('重選', '', () => { selected.clear(); render(); });
     add('不出', '', () => {
       socket.emit('pass', {}, (r) => { if (!r.ok) toast(r.reason, true); });

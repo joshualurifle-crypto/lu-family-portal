@@ -1,6 +1,6 @@
 {
   "name": "dalaoer",
-  "version": "1.7.0",
+  "version": "1.9.0",
   "description": "大老二 (Big Two) — 盧家遊戲入口模組",
   "main": "src/server.js",
   "scripts": {

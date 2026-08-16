@@ -126,6 +126,73 @@ console.log('\n§H  葫蘆 / 鐵支只比關鍵點數');
 }
 
 // ===========================================================================
+console.log('\n炸彈：鐵支與同花順可以壓任何張數（CIO 8/16）');
+// ===========================================================================
+{
+  const quad = id([C(9, 0), C(9, 1), C(9, 2), C(9, 3), C(3, 0)]);
+  const sf = id([C(3, 0), C(4, 0), C(5, 0), C(6, 0), C(7, 0)]);
+  const single2 = id([C(2, 3)]);          // 黑桃2，全場最大單張
+  const pairA = id([C('A', 2), C('A', 3)]);
+  const tripleK = id([C('K', 0), C('K', 1), C('K', 2)]);
+  const straight = id([C(10, 0), C('J', 1), C('Q', 2), C('K', 3), C('A', 0)]);
+  const flush = id([C('A', 0), C('J', 0), C(9, 0), C(6, 0), C(4, 0)]);
+  const fullHouse = id([C('A', 0), C('A', 1), C('A', 2), C('K', 0), C('K', 1)]);
+
+  ok('鐵支壓單張', E.beats(quad, single2));
+  ok('鐵支壓對子', E.beats(quad, pairA));
+  ok('鐵支壓三條', E.beats(quad, tripleK));
+  ok('鐵支壓順子', E.beats(quad, straight));
+  ok('鐵支壓同花', E.beats(quad, flush));
+  ok('鐵支壓葫蘆', E.beats(quad, fullHouse));
+
+  ok('同花順壓單張', E.beats(sf, single2));
+  ok('同花順壓對子', E.beats(sf, pairA));
+  ok('同花順壓葫蘆', E.beats(sf, fullHouse));
+
+  ok('黑桃2 壓不了鐵支', !E.beats(single2, quad));
+  ok('葫蘆壓不了鐵支', !E.beats(fullHouse, quad));
+  ok('順子壓不了同花順', !E.beats(straight, sf));
+
+  ok('同花順 > 鐵支', E.beats(sf, quad));
+  ok('鐵支壓不了同花順', !E.beats(quad, sf));
+
+  const bigQuad = id([C('K', 0), C('K', 1), C('K', 2), C('K', 3), C(3, 0)]);
+  ok('大鐵支壓小鐵支', E.beats(bigQuad, quad));
+  ok('小鐵支壓不了大鐵支', !E.beats(quad, bigQuad));
+}
+{
+  // 實際出牌：桌上一張黑桃2，用鐵支五張壓過去
+  const g = rig([
+    [C(9, 0), C(9, 1), C(9, 2), C(9, 3), C(3, 0)],
+    [C(2, 3), C(3, 1)],
+    [C(5, 0), C(3, 2)],
+    [C(6, 0), C(3, 3)],
+  ], { strictMode: true });
+  g.turn = 1;
+  g.play(1, [C(2, 3)]);
+  eq('輪到丙', g.turn, 2);
+  g.pass(2); g.pass(3);
+  eq('輪回甲', g.turn, 0);
+  const r = g.play(0, [C(9, 0), C(9, 1), C(9, 2), C(9, 3), C(3, 0)]);
+  ok('五張鐵支壓得過一張黑桃2', r.ok, JSON.stringify(r));
+  eq('桌上換成鐵支', g.current.label, '鐵支');
+}
+{
+  // 嚴格模式下，普通五張壓不了單張
+  const g = rig([
+    [C(10, 0), C('J', 1), C('Q', 2), C('K', 3), C('A', 0)],
+    [C(2, 3), C(3, 1)],
+    [C(5, 0), C(3, 2)],
+    [C(6, 0), C(3, 3)],
+  ], { strictMode: true });
+  g.turn = 1;
+  g.play(1, [C(2, 3)]);
+  g.pass(2); g.pass(3);
+  const r = g.play(0, [C(10, 0), C('J', 1), C('Q', 2), C('K', 3), C('A', 0)]);
+  ok('順子不是炸彈，壓不了單張', r.ok === false, JSON.stringify(r));
+}
+
+// ===========================================================================
 console.log('\n§B3  玩家可以自由拆牌');
 // ===========================================================================
 {

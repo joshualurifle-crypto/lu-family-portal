@@ -460,13 +460,16 @@ body::before {
 .btn-big { font-size: 22px; padding: 18px; }
 
 /* ─────────── 抓牌（規範 §8.2） ─────────── */
-.challenge { display: flex; justify-content: center; padding: 6px 0 2px; }
+.challenge { display: flex; justify-content: center; padding: 2px 16px 6px; }
+/* 抓不是常用動作，做小一點放最底下，不要占住視線（CIO 8/16） */
 .btn-catch {
-  background: #b4432f; color: #fff; border: 0;
-  font-size: 19px; font-weight: 700; padding: 12px 22px; border-radius: 999px;
-  box-shadow: 0 3px 0 #7e2c1e; cursor: pointer;
+  background: transparent; color: rgba(232,236,233,.55);
+  border: 1px solid rgba(180,67,47,.55);
+  font-size: 13px; font-weight: 600; padding: 5px 14px;
+  border-radius: 999px; cursor: pointer; box-shadow: none;
 }
-.btn-catch:active { transform: translateY(2px); box-shadow: 0 1px 0 #7e2c1e; }
+.btn-catch:hover { color: #fff; border-color: #b4432f; background: rgba(180,67,47,.18); }
+.btn-catch:active { transform: translateY(1px); }
 
 /* ─────────── 斷線凍結（規範 §5.3） ─────────── */
 .pause {
@@ -601,3 +604,27 @@ body::before {
   font-size: 13px; background: #b4432f; color: #fff;
   padding: 2px 7px; border-radius: 999px; margin-left: 6px;
 }
+
+/* ─────────── 分組：把組好的牌先放一邊 ─────────── */
+.groups {
+  display: flex; gap: 10px; flex-wrap: wrap;
+  padding: 0 16px 8px; justify-content: center;
+}
+.group {
+  background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.12);
+  border-radius: 12px; padding: 6px 8px 8px; cursor: pointer;
+}
+.group.group-on { border-color: #f2c14e; background: rgba(242,193,78,.14); }
+.group-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 13px; opacity: .8; margin-bottom: 4px; padding: 0 2px;
+}
+.group.group-on .group-head { opacity: 1; color: #f2c14e; }
+.group-x {
+  background: none; border: 0; color: inherit; opacity: .6;
+  font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.group-x:hover { opacity: 1; color: #b4432f; }
+.group-cards { display: flex; }
+.group-cards .card { margin-left: calc(var(--overlap) * -1); }
+.group-cards .card:first-child { margin-left: 0; }

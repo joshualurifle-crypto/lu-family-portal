@@ -195,10 +195,30 @@ function compareKey(a, b) {
   return 0;
 }
 
+/**
+ * 炸彈：鐵支和同花順（CIO 8/16）。
+ * 這兩種牌型可以壓過「任何張數」的牌 —— 單張、對子、三條、
+ * 順子、同花、葫蘆通通吃得下，不受張數相同的限制。
+ * 炸彈對炸彈才回到正常比法：同花順 > 鐵支，同類再比大小。
+ */
+function isBomb(meld) {
+  return !!meld && meld.type === TYPE.FIVE
+    && (meld.category === FIVE_CAT.FOUR_KIND || meld.category === FIVE_CAT.STRAIGHT_FLUSH);
+}
+
 /** challenger 是否大得過 current（兩者皆為 identify() 的結果） */
 function beats(challenger, current) {
   if (!challenger) return false;
   if (!current) return true;
+
+  const cBomb = isBomb(challenger);
+  const curBomb = isBomb(current);
+
+  // 炸彈打非炸彈：張數不用一樣，直接壓過去
+  if (cBomb && !curBomb) return true;
+  // 非炸彈打炸彈：不管幾張都沒用
+  if (!cBomb && curBomb) return false;
+
   if (challenger.size !== current.size) return false; // 張數必須相同
   if (challenger.type === TYPE.FIVE) {
     if (challenger.category !== current.category) return challenger.category > current.category;
@@ -252,8 +272,9 @@ function validatePlay({ hand, cards, current, isNewRound, rules = DEFAULT_RULES 
   // 原本的 V-3（第一手必須含梅花3）已由 CIO 取消。
   if (isNewRound) return { ok: true, meld };
 
-  if (meld.size !== current.size) {
-    return { ok: false, reason: `必須出 ${current.size} 張` };
+  // 炸彈不受張數限制（CIO 8/16）
+  if (meld.size !== current.size && !isBomb(meld)) {
+    return { ok: false, reason: `必須出 ${current.size} 張，或用鐵支／同花順壓` };
   }
   if (!beats(meld, current)) {
     return { ok: false, reason: '牌不夠大' };
@@ -315,11 +336,18 @@ function allMelds(hand, size, rules = DEFAULT_RULES) {
 
 /** 所有能壓過 current 的出法；current 為 null 時代表新一輪，回傳所有合法牌型 */
 function legalPlays(hand, current, rules = DEFAULT_RULES) {
-  const sizes = current ? [current.size] : [1, 2, 3, 5];
+  // 桌上有牌時本來只需要看同張數的組合，
+  // 但炸彈（鐵支／同花順）不受張數限制，所以五張永遠要算進來。
+  const sizes = current
+    ? (current.size === 5 ? [5] : [current.size, 5])
+    : [1, 2, 3, 5];
   const out = [];
+  const seen = new Set();
   for (const s of sizes) {
     for (const cand of allMelds(hand, s, rules)) {
-      if (!current || beats(cand.meld, current)) out.push(cand);
+      const key = cand.cards.join(',');
+      if (seen.has(key)) continue;
+      if (!current || beats(cand.meld, current)) { seen.add(key); out.push(cand); }
     }
   }
   return out;
@@ -329,6 +357,6 @@ module.exports = {
   RANK_NAMES, SUIT_NAMES, SUIT_SYMBOLS, CLUB_THREE, SPADE_TWO,
   TYPE, FIVE_CAT, FIVE_CAT_NAMES, DEFAULT_RULES,
   rankOf, suitOf, cardName, cardsName,
-  identify, beats, compareKey, straightInfo, STRAIGHT_LADDER, deal, shuffledDeck,
+  identify, beats, isBomb, compareKey, straightInfo, STRAIGHT_LADDER, deal, shuffledDeck,
   validatePlay, legalPlays, allMelds, combinations,
 };
