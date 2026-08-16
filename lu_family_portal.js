@@ -2,13 +2,17 @@
    LU FAMILY GAME PORTAL — 盧家遊樂園（德州撲克 + 台灣麻將十六張）(zero dependencies)
    Run:   node lu_family_portal.js
    TV:    open the printed URL on the big screen  (host view)
+
    Phones: scan the QR shown on the TV            (player view)
    Fixed-limit 10/20 · blinds 5/10 · 2–5 players · AI fill
    ============================================================ */
 "use strict";
 const http = require("http");
 const os   = require("os");
+
 const crypto = require("crypto");
+   const { attach } = require('./dalaoer/src/server');
+attach(app, io, { mount: '/dalaoer' });
 const PORT = process.env.PORT || 3000;
 
 /* ================= GAME ENGINE ================= */
