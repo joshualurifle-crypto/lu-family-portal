@@ -1,158 +1,92 @@
-# 大老二 — 盧家遊戲入口模組
+# 盧家遊樂園 · Lu Family Game Portal
 
-四人線上大老二，支援標準玩法與盧家玩法（開局換牌、對賭）。
-規格見 `BigTwo_Spec_v1.5.1.docx`；程式碼註解裡的 §編號都對得上那份文件。
+德州撲克 · 台灣麻將十六張 · 合約橋牌 · 大老二 — 一個 Node 程序，電視當牌桌，手機當手牌。
 
 ---
 
-## 在自己電腦上跑跑看
+## Deploying to Render (clean slate)
+
+**This folder is the whole application.** Nothing else is needed. Do not upload
+`node_modules` — Render builds it from `package.json`.
+
+### 1. Wipe what is there now
+
+In the Render dashboard, on the `lu-family-portal` service:
+
+- **Settings → Delete Service**, then create a new Web Service, **or**
+- if you deploy from Git: delete every file in the repository, commit the deletion,
+  then copy this folder in and commit that. A clean history is not required —
+  an empty commit followed by these files is enough.
+
+Deleting the service also clears the build cache, which is the cleanest option
+and takes about a minute to recreate.
+
+### 2. Service settings
+
+| Field | Value |
+|---|---|
+| Environment | Node |
+| Build command | `npm install` |
+| Start command | `npm start` |
+| Node version | 18 or newer (`engines` in package.json already asks for this) |
+| Health check path | `/` |
+
+No environment variables are required. Render supplies `PORT` and the server reads it.
+
+### 3. What you get
+
+| URL | Who opens it |
+|---|---|
+| `https://lu-family-portal.onrender.com/` | The TV / big screen — 大廳, seating, and the card table |
+| `https://lu-family-portal.onrender.com/join` | Every phone — scan the QR on the TV |
+| `https://lu-family-portal.onrender.com/dalaoer/` | 大老二 (its own room codes) |
+
+---
+
+## Two things to know about running on Render rather than the living-room Wi-Fi
+
+**1. The free tier sleeps.** After about 15 minutes with nobody connected, Render
+stops the service. All game state is held in memory, so a sleep ends whatever
+table was open. The first person back waits ~30 seconds for it to wake, and starts
+a fresh table. If that becomes annoying, a paid instance stays awake.
+
+**2. The address is public.** On the home Wi-Fi only the family could reach the
+server, so it has no passwords and no access control — that was the ruling, and it
+was the right one for a LAN. On the open internet anyone who has the link can join
+the table, and from the TV page can also reorder seats or remove players. Nobody
+can see another player's cards — that protection is real and unchanged — but the
+table itself is open to anyone with the URL.
+
+For a family game on an obscure URL that is usually fine. If it stops being fine,
+say so and a door code takes about twenty minutes to add.
+
+---
+
+## Running it at home instead
 
 ```bash
-cd dalaoer
 npm install
 npm start
 ```
 
-**Windows：** 用 PowerShell 或命令提示字元都可以，指令一樣。
-要換連接埠的話，PowerShell 是 `$env:PORT=8080; npm start`，
-命令提示字元是 `set PORT=8080 && npm start`。
-所有指令都要在 `dalaoer` 這個資料夾裡面下，不然 npm 找不到 package.json。
+The console prints the LAN address for the TV and for the phones.
 
-然後開 <http://localhost:3000>。
-
-一個人也玩得起來：空位會自動由電腦補上。想換連接埠就 `PORT=8080 npm start`。
-
-**建議第一次這樣試：**
-
-1. 進入畫面輸入名字 → 開新房
-2. 設定裡把「出牌檢查」切到 **寬鬆**，這樣才看得到抓牌按鈕
-   （注意：已經沒有「出牌時限」這個設定了，見下方）
-3. 按開始 → 會先出現**座位確認**畫面（這時候還沒發牌）
-4. 用 ◀ ▶ 挪位子，按「座位沒錯，開始發牌」
-5. 等電腦出一手，牌桌上方就會出現紅色的「抓 ⋯⋯ 這手」
-
-想試盧家玩法，在設定裡把「玩法」切到**盧家**，就會多出換牌和對賭兩段。
-
-想試斷線凍結，用手機和電腦各開一個分頁加入同一間房，把其中一邊關掉。
-
----
-
-## 掛進盧家遊戲入口
-
-完整說明見 **`PORTAL.md`**。摘要：
-
-入口那邊已經有 express 和 socket.io，直接接上去就好：
-
-```js
-const { attach } = require('./dalaoer/src/server');
-
-attach(app, io, { mount: '/dalaoer' });
-```
-
-之後 <http://你的網址/dalaoer> 就是大老二。
-
-`attach` 會自己開一個同名的 socket.io namespace，**不會**跟入口底下的撲克桌或麻將搶連線。
-要換路徑就改 `mount`；namespace 預設跟著 `mount` 走，也可以另外指定：
-
-```js
-attach(app, io, { mount: '/games/big2', namespace: '/big2' });
-```
-
-`test/mount.test.js` 就是在驗這件事：同一個 io 底下同時掛撲克桌和大老二，兩邊互不干擾。
-
----
-
-## 測試
-
-`npm run sim` 會跑一分半左右，順便印出 AI 強度（對隨機出牌約 56% 勝率，基準是 25%）。
+## Self-checks
 
 ```bash
-npm test     # 牌型、v1.5 定案、抓牌、掛載、防護   210 項
-npm run e2e  # 端對端走 socket 一整輪            54 項
-npm run sim  # 600 局 AI 自我對戰
+MJ_TEST=50 npm start          # 50 mahjong hands, asserts the scoring balances
+node regress_mjclaim.js       # claim window vs a disconnected player (no server needed)
 ```
 
-**注意：** 測試一律在同一個 node 行程裡開伺服器（`test/e2e_inproc.js`）。
-把伺服器丟到背景再測會把工具卡住，這是環境限制，不是模組的問題。
+The full test suites and the independent-review pack live in
+`LU_PORTAL_REVIEW_2026-08-23_revC.zip`, not in this deploy folder — they are not
+needed to run the game and would pull in extra dependencies.
 
-電腦的思考延遲預設 0.7–1.6 秒。測試檔會自己把它調到 0.05，
-不用在指令前面加環境變數（Windows 的 cmd 也不吃那種寫法）。
+## What is in here
 
----
-
-## 檔案
-
-| 路徑 | 做什麼 |
+| File | What it is |
 |---|---|
-| `src/engine.js` | 牌、牌型辨識、大小比較、合法出牌列舉 |
-| `src/game.js` | 單局狀態機：換牌、對賭、抓牌、結算 |
-| `src/ai.js` | 電腦的出牌策略 |
-| `src/server.js` | express + socket.io、房間、座位、斷線凍結 |
-| `public/` | 介面（繁體中文、大字體） |
-| `test/` | 上面那三組測試 |
-
----
-
-## 幾件事情值得先知道
-
-**抓牌按鈕每一手都會出現。** 這是故意的：如果只在真的不合法的時候才亮，等於畫面直接把答案講出來，寬鬆模式就沒意義了。伺服器心裡知道，但按下去才會講。
-
-**抓對了會退回重出**，中間別人 PASS 的紀錄一併作廢。抓錯了不罰，但那一手就定案，不能再抓。
-時限沒有秒數，是由「下一手出牌」「三家都不出」「抓失敗」這三件事關掉的。
-
-**沒有任何倒數。** 想多久都可以，不會有人替你出牌。真的有人不在了，
-其他在線上的人**全部同意**才能把那個位子換成電腦，或收掉這一局。
-一個人不同意就作廢，而且不會再問第二次。
-
-**出完最後一張不算立刻結束。** 其他三家要各自按「確認結束」，
-或者趁還來得及的時候抓那最後一手。三家到齊才結算。
-按過確認的人就不能再抓了。
-
-**盧家玩法蓋牌張數一樣多時要當眾擲骰子**，每個人自己按，點數大的先抽。
-
-**手牌可以自己排**：右上角「依大小 / 依花色」。伺服器只管牌在不在你手上，
-怎麼排是你家的事，換局也記得你的選擇。
-
-**桌面上方有出牌歷史**，最近幾手橫向排開，最新的一手加亮，
-不用記也看得出誰出過什麼。
-
-**選錯牌按「重選」**，蓋牌和出牌階段都有。
-換牌時可以選「點要蓋的」或「點要留的」，兩種習慣都行。
-
-**桌面上方會一直顯示在等誰做什麼**，畫面沒動的時候就知道卡在誰身上。
-
-**整局一張牌都沒出過的人，賠雙倍。** 13 張 × 5 元 × 2 = 130 元。
-結算畫面會標出來是誰。
-
-**出牌歷史只顯示這一墩**，一墩結束就自動清掉。
-
-**可以把組好的牌先放一邊**：選兩張以上按「分成一組」，那組就會獨立放在手牌上方，
-剩下的牌照樣依大小或花色排。系統認得出來的話會標牌型（順子、葫蘆⋯⋯）。
-點整組一次選起來就能出牌，按組上的 × 拆開。
-分組只是這台裝置上的整理，伺服器不知道，也不影響規則。
-
-**牌隨時都選得起來**，不用等輪到自己 —— 等別人的時候正好理牌。
-蓋牌階段也可以分組，先把好牌組起來，剩下的就知道該丟什麼。
-
-**鐵支和同花順是炸彈。** 這兩種牌型可以壓過任何張數的牌 ——
-單張、對子、三條、順子、同花、葫蘆通通吃得下，不受「張數要一樣」的限制。
-炸彈對炸彈才回到正常比法：同花順大於鐵支，同類再比點數。
-
-**斷線之後直接重新整理就好。** 這台裝置記得你的位子，
-一進頁面就自動回到原本的座位和手牌，不用重打名字和房號。
-
-**打到一半不能按重來。** 伺服器會擋掉 startGame 和 nextGame，
-因為那等於把一局的分數和金錢直接抹掉。要收掉只有一條路：
-提議「結束這一局」，在場的人全部同意。
-
-**凍結期間伺服器什麼動作都不收**，包括出牌、不出、抓、換牌。
-只有提案和投票還能用，否則整桌永遠出不來。
-
-**座位確認階段有人跑掉**，那個位子當場交給電腦（還沒發牌，沒人的牌會受影響），
-本人的 token 留著，隨時可以要回去。位子不會被刪掉，不然發牌會少一家。
-
-**有人斷線整桌會停下來等**，手牌和輪次都凍在原地。他用同一台裝置回來就自動回到原位。
-被換成電腦的人隨時可以把位子要回來，打到一半也行，不用經過誰同意；
-電腦已經做掉的動作照算，不會倒帶。
-
-**帳是一場一場算的**，從開桌到散場，重開伺服器就歸零。沒有跨日累計，也沒有歷史紀錄。
+| `lu_family_portal.js` | The portal: HTTP + SSE server, poker, mahjong and bridge engines, and both web pages |
+| `dalaoer/src/` | 大老二 rules, game state, computer player, socket server |
+| `dalaoer/public/` | 大老二 phone client |
+| `package.json` | Dependencies and the start script — this is the only one Render reads |

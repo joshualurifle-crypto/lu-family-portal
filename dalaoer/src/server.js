@@ -19,6 +19,11 @@ const DELAY_SCALE = process.env.DALAOER_BOT_DELAY !== undefined
   ? Number(process.env.DALAOER_BOT_DELAY) : 1;
 const BOT_DELAY = { min: 700 * DELAY_SCALE, max: 1600 * DELAY_SCALE };
 
+// §I 斷線之後的「等候時間」。時間到不會自動做任何事 —— 它只是桌上共同的預期，
+//    在場的人可以無限延長。要真的動別人的位子，還是得全體同意。
+const HOLD_MS = 5 * 60 * 1000;        // CIO：給 3~5 分鐘回來
+const HOLD_EXTEND_MS = 5 * 60 * 1000;
+
 const rooms = new Map();
 
 // ---------------------------------------------------------------------------
@@ -127,18 +132,16 @@ class Room {
     if (this.game && this.game.phase !== PHASE.FINISHED) {
       this.seats[idx].socketId = null;      // 位子留著，token 留著
 
-      // §Q 只有「還等著他做決定」的時候才需要停下來。
-      //    暫定結束時的贏家沒有待辦動作，其他三家照樣可以確認或抓。
-      const g = this.game;
-      const waitingOnHim = g.phase === PHASE.PROVISIONAL_FINISH
-        ? g.pendingConfirmers().includes(idx)
-        : true;
-      if (!waitingOnHim) {
+      // §Q + CIO 2026-08-23：牌局照打，打到「真的輪到他」才停下來等。
+      //   以前是一斷線就整桌凍結；現在只有他手上真的有待辦動作時才等。
+      //   這一條同時套用在入口的撲克／麻將／橋牌，四個遊戲行為一致。
+      if (!this._holdIfSomeoneAway()) {
+        // 還沒輪到他 —— 牌局照打，等打到他那一手再停
         this.broadcastLobby();
         this.broadcastState();
+        this.driveBots();
         return;
       }
-      this.pause(idx);
       this.broadcastLobby();
       this.broadcastState();
       return;
@@ -174,12 +177,41 @@ class Room {
     if (this.seats.every((s) => s === null || s.isBot)) rooms.delete(this.code);
   }
 
-  /** 凍結：等他回來。沒有倒數，等多久都可以（§I） */
+  /**
+   * 凍結：等他回來。
+   *
+   * §I 還是沒有「時間到就自動動你的位子」這回事 —— 時間到什麼都不會發生。
+   * 這裡只多一個「還要等他多久」的顯示，讓桌上的人有個共同的預期，
+   * 而且任何在場的人都可以按「再等 5 分鐘」把它往後推（多等一點永遠是安全的，
+   * 所以不用投票）。等候時間到了，畫面只是把兩個提案標亮，決定權還是在大家手上。
+   */
   pause(seat) {
     if (this.paused) return;
-    this.paused = { seat, name: this.seats[seat].name };
+    this.paused = {
+      seat,
+      name: this.seats[seat].name,
+      since: Date.now(),
+      until: Date.now() + HOLD_MS,
+      extends: 0,
+    };
     this.clearTimers();
-    this.io.to(this.code).emit('toast', `${this.seats[seat].name} 斷線了，牌局暫停`);
+    this.io.to(this.code).emit('toast',
+      `${this.seats[seat].name} 斷線了，牌局暫停 — 先等 ${Math.round(HOLD_MS / 60000)} 分鐘`);
+  }
+
+  /** 再多等他一會兒。任何在場的真人都可以按，不需要表決。 */
+  extendHold(bySeat) {
+    if (!this.paused) return { ok: false, reason: '現在沒有人斷線' };
+    const now = Date.now();
+    const base = Math.max(now, this.paused.until || now);
+    this.paused.until = base + HOLD_EXTEND_MS;
+    this.paused.extends = (this.paused.extends || 0) + 1;
+    const who = this.seats[bySeat] ? this.seats[bySeat].name : '有人';
+    this.io.to(this.code).emit('toast',
+      `${who} 把等候時間延長 ${Math.round(HOLD_EXTEND_MS / 60000)} 分鐘`);
+    this.broadcastState();
+    this.broadcastLobby();
+    return { ok: true, until: this.paused.until };
   }
 
   // -------------------------------------------------------------------------
@@ -306,6 +338,12 @@ class Room {
    * §J 原本那個人的 token 留著，他隨時可以按「回來玩」把位子要回去，
    *    包括打到一半、換牌換到一半。已經做過的動作照算，不回捲。
    */
+  /**
+   * CIO 2026-08-23：換電腦代打不用再表決，任何一位在座的真人開口就算。
+   * 這一條 **取代** 原本「全體同意才能動別人的位子」裡關於換電腦的部分；
+   * 「收掉這一局」因為會把大家的牌全部作廢，仍然要全體同意。
+   * 本人的 token 留著，隨時可以按「回來玩」把位子要回去，已經做過的不回捲。
+   */
   botSeat(seat, approved) {
     if (!approved) return { ok: false, reason: '要大家同意才能換電腦' };
     const prev = this.seats[seat];
@@ -412,10 +450,26 @@ class Room {
     if (this.botTimer) { clearTimeout(this.botTimer); this.botTimer = null; }
   }
 
+  /**
+   * 輪到一個「人不在」的位子了嗎？
+   * CIO 2026-08-23：斷線不再馬上凍結整桌，而是打到真的需要他的時候才停下來等。
+   * 所以停不停不能只在斷線那一刻判斷 —— 每次動作之後都要重新看一次。
+   */
+  _holdIfSomeoneAway() {
+    const g = this.game;
+    if (!g || this.paused || g.phase === PHASE.FINISHED) return false;
+    for (const seat of (g.waitingOn().seats || [])) {
+      const st = this.seats[seat];
+      if (st && !st.isBot && !st.socketId) { this.pause(seat); return true; }
+    }
+    return false;
+  }
+
   /** 每次動作之後：檢查結束、廣播、催電腦 */
   afterAction() {
     const g = this.game;
     if (!g) return;
+    this._holdIfSomeoneAway();
     if (this.paused) { this.clearTimers(); this.broadcastState(); return; }
     if (g.phase === PHASE.FINISHED && !g.__settled) {
       g.__settled = true;
@@ -473,7 +527,7 @@ class Room {
         // 由真人決定何時開打（規範 ruling 5、13）
         for (let s = 0; s < 4; s++) {
           if (!this.seats[s].isBot || this.declareResponses[s] !== undefined) continue;
-          if (AI.shouldDeclareBet(g.hands[s])) { g.declareBet(s); acted = true; break; }
+          if (AI.shouldDeclareBet(g.hands[s], this.options.rules)) { g.declareBet(s); acted = true; break; }
           this.declareResponses[s] = false;
           acted = true;
         }
@@ -488,7 +542,7 @@ class Room {
         for (let s = 0; s < 4; s++) {
           if (s === g.bet.declarer || !this.seats[s].isBot) continue;
           if (g.bet.responses[s] !== undefined) continue;
-          const accept = AI.shouldAcceptBet(g.hands[s]);
+          const accept = AI.shouldAcceptBet(g.hands[s], this.options.rules);
           this.io.to(this.code).emit('toast',
             `${this.seats[s].name} ${accept ? '同意' : '不同意'}對賭`);
           g.respondBet(s, accept);
@@ -498,10 +552,18 @@ class Room {
       } else if (g.phase === PHASE.PLAYING) {
         const seat = g.turn;
         if (this.seats[seat].isBot) {
+          // 進階電腦要看得到「每家剩幾張、誰 PASS 掉什麼、誰還沒出過牌」——
+          // 這些桌上本來就是公開的（§K），跟真人看到的一樣多。
           const d = AI.choosePlay({
+            seat,
             hand: g.hands[seat],
             current: g.current,
             playedCards: g.playedCards,
+            counts: g.hands.map((h) => h.length),
+            passInfo: g.passLog || [[], [], [], []],
+            passesInARow: g.passed.filter(Boolean).length,
+            lastPlayerSeat: g.lastPlayerSeat,
+            everPlayed: [0, 1, 2, 3].map((s) => g.history.some((h) => h.seat === s)),
             opponentCounts: g.hands.map((h, i) => (i === seat ? null : h.length)).filter((x) => x !== null),
             isFirstPlay: g.isFirstPlay,
             rules: this.options.rules,
@@ -739,6 +801,32 @@ function attach(app, io, opts = {}) {
     socket.on('play', ({ cards }, cb) =>
       withSeat(cb, (g, seat) => g.play(seat, cards)));
 
+    /**
+     * 教練模式：幫我把手牌分組。
+     *
+     * §K 資訊防火牆：只看「這個座位自己的手牌」，回傳的也只有他自己的牌。
+     * 沒有碰到任何別人的手牌、沒有碰到蓋起來的換牌，
+     * 所以這不是作弊 —— 等於有人坐在旁邊幫你把牌理一理。
+     */
+    socket.on('suggestGroups', (_, cb) => {
+      if (!room) return ack(cb, { ok: false, reason: '你不在任何房間' });
+      const seat = room.seatOf(socket.id);
+      if (seat < 0) return ack(cb, { ok: false, reason: '你不在座位上' });
+      const g = room.game;
+      if (!g) return ack(cb, { ok: false, reason: '現在沒有牌局' });
+      const hand = g.hands[seat] || [];
+      if (!hand.length) return ack(cb, { ok: true, groups: [] });
+      let melds;
+      try { melds = AI.decompose(hand, room.options.rules).melds; }
+      catch (e) { return ack(cb, { ok: false, reason: '分不出來，手動理牌吧' }); }
+      const groups = melds
+        .filter((m) => m.cards.length >= 2)
+        .map((m) => ({ cards: [...m.cards].sort((a, b) => a - b), label: m.meld ? m.meld.label : '' }))
+        .sort((a, b) => b.cards.length - a.cards.length || a.cards[0] - b.cards[0]);
+      const singles = melds.filter((m) => m.cards.length === 1).length;
+      ack(cb, { ok: true, groups, hands: melds.length, singles });
+    });
+
     socket.on('pass', (_, cb) =>
       withSeat(cb, (g, seat) => g.pass(seat)));
 
@@ -776,7 +864,24 @@ function attach(app, io, opts = {}) {
       const seat = room.seatOf(socket.id);
       if (seat < 0) return ack(cb, { ok: false, reason: '你不在座位上' });
       if (kind !== 'BOT' && kind !== 'END') return ack(cb, { ok: false, reason: '沒有這種提案' });
+      // CIO 2026-08-23：換電腦代打不用表決，開口就換。收掉整局仍要全體同意。
+      if (kind === 'BOT') {
+        const t = Number.isInteger(target) ? target : -1;
+        if (t < 0 || t > 3 || !room.seats[t]) return ack(cb, { ok: false, reason: '沒有這個位子' });
+        if (room.seats[t].isBot) return ack(cb, { ok: false, reason: '那個位子已經是電腦了' });
+        if (room.seats[t].socketId) return ack(cb, { ok: false, reason: '那個人還在線上' });
+        room.io.to(room.code).emit('toast', `${room.seats[t].name} 改由電腦代打`);
+        return ack(cb, room.botSeat(t, true));
+      }
       ack(cb, room.propose(seat, kind, target));
+    });
+
+    // 再等他一下 —— 多等永遠不傷害任何人，所以不用表決
+    socket.on('extendHold', (_, cb) => {
+      if (!room) return ack(cb, { ok: false, reason: '你不在任何房間' });
+      const seat = room.seatOf(socket.id);
+      if (seat < 0) return ack(cb, { ok: false, reason: '你不在座位上' });
+      ack(cb, room.extendHold(seat));
     });
 
     socket.on('vote', ({ agree }, cb) => {

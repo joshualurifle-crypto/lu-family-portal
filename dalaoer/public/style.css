@@ -628,3 +628,12 @@ body::before {
 .group-cards { display: flex; }
 .group-cards .card { margin-left: calc(var(--overlap) * -1); }
 .group-cards .card:first-child { margin-left: 0; }
+
+/* ---- 斷線等候時間（§I：時間到不會自動做任何事） ---- */
+.hold-line{font-size:1.35rem;font-weight:800;letter-spacing:.02em;margin:6px 0 10px;
+  font-variant-numeric:tabular-nums;}
+.hold-line.hold-out{color:#c0392b;}
+
+/* ---- 教練模式 ---- */
+.btn-coach-on{background:#2f7d3e;color:#fff;border-color:#2f7d3e;}
+.coach-tally{font-size:.78rem;color:#2f7d3e;font-weight:600;margin:4px 2px 2px;}

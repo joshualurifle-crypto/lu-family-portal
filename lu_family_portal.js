@@ -17,6 +17,15 @@ const SUITS=["♠","♥","♦","♣"], RNAME={11:"J",12:"Q",13:"K",14:"A"};
 const HAND_NAMES=["High card","Pair","Two pair","Three of a kind","Straight","Flush","Full house","Four of a kind","Straight flush"];
 const AI_NAMES=["Bot Ada","Bot Ben","Bot Cleo","Bot Dex"];
 
+/* 桌號：開機時產生一次。四個人的手機上如果看到同一個桌號，就是同一桌。
+   （這台伺服器只有一桌，桌號是給人確認用的，不是用來分房間的。）*/
+function makeTableCode(){
+  const A="ACDEFGHJKLMNPQRTUVWXY34679";   // 拿掉看起來像的 B/8 I/1 O/0 S/5 Z/2
+  let out=""; for(let i=0;i<4;i++) out+=A[Math.floor(Math.random()*A.length)];
+  return out;
+}
+const TABLE_CODE = makeTableCode();
+
 let G = {
   phase:"lobby",          // lobby | play
   game:null,              // null = portal | "poker" | "mahjong"
@@ -139,7 +148,8 @@ function step(){
   if(n===-1) return endRound();
   G.turn=n;
   broadcast();
-  if(G.players[n].isAI) later(900,()=>aiAct(n));
+  // 代打的位子跟 AI 一樣由電腦接手（CIO 2026-08-23）
+  if(G.players[n].isAI||G.players[n].auto) later(900,()=>aiAct(n));
   // humans: wait for POST /api/action
 }
 function actionDone(i){
@@ -763,12 +773,39 @@ function mjDiscard(s,tile){
   if(claims.every(c=>c.resp!==null)){ broadcast(); mjLater(500,resolveClaims); return true; }
   M.claimUntil=Date.now()+10000;
   const cs=++M.claimSeq, sq=M.seq;
-  setTimeout(()=>{ if(M.claimSeq===cs&&M.seq===sq&&M.pending){
-    M.pending.claims.forEach(c=>{ if(!c.resp) c.resp={t:"pass"}; });
-    resolveClaims();
-  }},M.claimUntil-Date.now());
+  setTimeout(()=>mjClaimTimeout(cs,sq), M.claimUntil-Date.now());
   broadcast();
   return true;
+}
+
+/* 這個位子現在有沒有人看著？（真人、在線、而且沒交給電腦） */
+function mjSeatWatching(q){
+  const st=M.seats[q]; if(!st) return false;
+  if(st.auto) return false;
+  const p=seatP(q);
+  return !!p && !p.isAI && !!p.connected;
+}
+/**
+ * 宣告視窗到期時要不要硬幫人家 PASS。
+ *
+ * CIO 2026-08-23：斷線的人有 5 分鐘可以回來，所以 10 秒的視窗絕對不能替他決定
+ * 胡／碰／槓／吃／搶槓 —— 那是會改變輸贏的一手。人不在就把視窗撐著等，
+ * 等到他回來、或是有人把那個位子交給電腦為止。
+ * 在線上的人與電腦照樣 10 秒到就算 PASS，牌桌不會因為一個人發呆而卡住。
+ */
+function mjClaimTimeout(cs, sq){
+  if(!(M.claimSeq===cs && M.seq===sq && M.pending)) return;
+  const away=M.pending.claims.filter(c=>c.resp===null && !mjSeatWatching(c.seat));
+  const offline=away.filter(c=>{ const p=seatP(c.seat); return p && !p.isAI && !M.seats[c.seat].auto; });
+  if(offline.length){
+    // 有人斷線還沒回來 —— 視窗繼續掛著，每 2 秒再看一次
+    M.claimUntil=Date.now()+2000;
+    setTimeout(()=>mjClaimTimeout(cs,sq), 2000);
+    broadcast();
+    return;
+  }
+  M.pending.claims.forEach(c=>{ if(!c.resp) c.resp={t:"pass"}; });
+  resolveClaims();
 }
 function claimOptions(q,tile,from){
   if(tile>=34) return null;
@@ -870,10 +907,7 @@ function startJiagang(s,t){
   if(claims.every(c=>c.resp!==null)){ resolveClaims(); return true; }
   M.claimUntil=Date.now()+10000;
   const cs=++M.claimSeq, sq=M.seq;
-  setTimeout(()=>{ if(M.claimSeq===cs&&M.seq===sq&&M.pending){
-    M.pending.claims.forEach(c=>{ if(!c.resp) c.resp={t:"pass"}; });
-    resolveClaims();
-  }},M.claimUntil-Date.now());
+  setTimeout(()=>mjClaimTimeout(cs,sq), M.claimUntil-Date.now());
   broadcast();
   return true;
 }
@@ -1063,6 +1097,34 @@ function mjResumeAuto(s){
   }
 }
 
+
+/* ---------- 教練：把手牌拆成 順子／刻子／對子／搭子 ----------
+   §K 只看這一家自己的牌，回傳的也只有他自己的牌。跟真人請旁邊的人幫忙理牌一樣。   */
+function mjGroupPlan(hand){
+  const tiles=hand.filter(t=>t<34);
+  const cnt=countsOf(tiles);
+  let best=null, bestScore=-1, nodes=0;
+  const cur=[];
+  const SCORE={chow:100,pung:100,pair:26,part:12};
+  function total(){ let v=0; for(const g of cur) v+=SCORE[g.k]; return v; }
+  function rec(i){
+    if(++nodes>200000) return;
+    while(i<34&&cnt[i]===0) i++;
+    if(i>=34){ const v=total(); if(v>bestScore){ bestScore=v; best=cur.map(g=>({k:g.k,tiles:g.tiles.slice()})); } return; }
+    if(cnt[i]>=3){ cnt[i]-=3; cur.push({k:"pung",tiles:[i,i,i]}); rec(i); cur.pop(); cnt[i]+=3; }
+    if(i<27&&(i%9)<7&&cnt[i+1]>0&&cnt[i+2]>0){
+      cnt[i]--;cnt[i+1]--;cnt[i+2]--; cur.push({k:"chow",tiles:[i,i+1,i+2]}); rec(i); cur.pop();
+      cnt[i]++;cnt[i+1]++;cnt[i+2]++; }
+    if(cnt[i]>=2){ cnt[i]-=2; cur.push({k:"pair",tiles:[i,i]}); rec(i); cur.pop(); cnt[i]+=2; }
+    if(i<27&&(i%9)<8&&cnt[i+1]>0){ cnt[i]--;cnt[i+1]--; cur.push({k:"part",tiles:[i,i+1]}); rec(i); cur.pop(); cnt[i]++;cnt[i+1]++; }
+    if(i<27&&(i%9)<7&&cnt[i+2]>0){ cnt[i]--;cnt[i+2]--; cur.push({k:"part",tiles:[i,i+2]}); rec(i); cur.pop(); cnt[i]++;cnt[i+2]++; }
+    cnt[i]--; rec(i); cnt[i]++;                     // \u9019\u4e00\u5f35\u5148\u653e\u8457\u7576\u5b64\u5f35
+  }
+  rec(0);
+  const groups=(best||[]).filter(g=>g.k!=="part"||true)
+    .sort((a,b)=> b.tiles.length-a.tiles.length || a.tiles[0]-b.tiles[0]);
+  return groups;
+}
 /* ---------- mahjong state for clients ---------- */
 function mjPublicState(){
   return {
@@ -1071,7 +1133,7 @@ function mjPublicState(){
     pace:G.pace, handCount:M.handCount, claimUntil:M.pending?M.claimUntil:0,
     pendingTile:M.pending?{tile:M.pending.tile,from:M.pending.from,kind:M.pending.kind}:null,
     winInfo:M.winInfo,
-    roster:G.players.filter(p=>!p.isAI&&!p.removed).map(p=>({name:p.name,avatar:p.avatar||null,connected:!!p.connected})),
+    roster:rosterOf(),
     seats:M.seats.map((st,s)=>{
       const p=seatP(s)||{};
       return { name:p.name||"?", avatar:p.avatar||null, isAI:!!p.isAI, auto:!!st.auto,
@@ -1106,12 +1168,890 @@ function mjPrivateFor(token){
   };
 }
 
+/* ================= BRIDGE ENGINE — 橋牌 · Contract Bridge (Rubber) =================
+   Full Laws of Duplicate/Rubber Contract Bridge — no house changes.
+   Auction: legal-call enforcement, double / redouble, 3-pass end, pass-out.
+   Play:    13 tricks, follow-suit compulsory, trump / NT trick resolution.
+            盧家桌規：每個人打自己的牌，牌不攤開 —— 沒有明手。
+            莊家只出自己那手，同伴自己出自己的，四家的牌全程不公開。
+            人不在的時候才由電腦代打。（這一條偏離 Laws of Bridge 的明手規則，
+            叫牌與計分則完全照規則走。）
+   Score:   rubber bridge — below/above the line, vulnerability from games won,
+            doubled & redoubled penalties, insult, slam bonus, honours,
+            700/500 rubber bonus, 300/100 unfinished-rubber bonus.
+   Bots:    SAYC bidding (5-card majors, 15-17 NT, Stayman, Jacoby transfers,
+            weak twos, preempts, takeout doubles, negative doubles, Blackwood)
+            + Monte-Carlo double-dummy card play with constrained hand sampling.
+   ================================================================================ */
+const BR_BOT_NAMES=["電腦 Ada","電腦 Ben","電腦 Cleo","電腦 Dex"];
+const BSUIT=["♠","♥","♦","♣"];                 // suit index 0..3, high -> low
+const BSTRAIN=["♣","♦","♥","♠","NT"];          // strain 0..4, low -> high
+const ST2SU=[3,2,1,0];                          // strain -> suit index
+const SU2ST=[3,2,1,0];                          // suit index -> strain
+const BSEAT=["北 North","東 East","南 South","西 West"];
+const BSEATS=["N","E","S","W"];
+const HCPV=[0,0,0,0,0,0,0,0,0,1,2,3,4];         // rank index 0(=2)..12(=A)
+
+let BR = {
+  phase:"idle",            // idle | play
+  stage:"auction",         // auction | play | over
+  seats:[],                // {pi, hand:[cardId], auto:false, voids:[b,b,b,b], hcpLo, hcpHi}
+  dealer:0, board:0,
+  vuln:[false,false],      // [NS, EW]
+  auction:[],              // {seat,t:'P'|'X'|'XX'|'B',lvl,str}
+  contract:null,           // {lvl,str,dbl,declarer}
+  declarer:-1, dummy:-1,
+  turn:0, leader:0, trick:[], playedBy:[[],[],[],[]],
+  tricks:[0,0],            // tricks won [NS,EW]
+  trickHist:[],            // {cards:[{seat,card}], win}
+  lastTrick:null,
+  dummyShown:false, handOver:false, result:null,
+  rub:{ games:[0,0], below:[0,0], above:[0,0], total:[0,0], rubbers:[0,0], hist:[] },
+  banner:"", log:[], seq:0, thinking:false
+};
+
+/* ---------- cards ---------- */
+const cSuit=c=>(c/13)|0, cRank=c=>c%13;
+function cObj(c){ return {s:cSuit(c), r:cRank(c)+2}; }
+function cStr(c){ return BSUIT[cSuit(c)]+(["2","3","4","5","6","7","8","9","10","J","Q","K","A"][cRank(c)]); }
+function brBanner(t){ BR.banner=t; BR.log.unshift(t); BR.log=BR.log.slice(0,7); }
+function brLater(ms,fn){ const s=BR.seq;
+  setTimeout(()=>{ if(BR.seq===s && G.game==="bridge" && BR.phase==="play") fn(); }, Math.round(ms*G.pace)); }
+function brSeatP(s){ return G.players[BR.seats[s].pi]; }
+function brName(s){ const p=brSeatP(s); return p? p.name : BSEAT[s]; }
+function brSide(s){ return s%2; }               // 0 = N/S, 1 = E/W
+function brIsBot(s){ const p=brSeatP(s); return !p || p.isAI || BR.seats[s].auto; }
+function brSortHand(h){ h.sort((a,b)=> cSuit(a)-cSuit(b) || cRank(b)-cRank(a) ); }
+function brHcp(h){ let n=0; h.forEach(c=>n+=HCPV[cRank(c)]); return n; }
+function brShape(h){ const l=[0,0,0,0]; h.forEach(c=>l[cSuit(c)]++); return l; }
+function brSuitCards(h,s){ return h.filter(c=>cSuit(c)===s).sort((a,b)=>cRank(b)-cRank(a)); }
+function brBalanced(l){ const d=[...l].sort((a,b)=>b-a); return (d[0]<=5&&d[3]>=2&&!(d[0]===5&&d[1]===4&&d[3]===2&&false)) &&
+  (d.join("")==="4333"||d.join("")==="4432"||d.join("")==="5332"); }
+
+/* ---------- deal ---------- */
+function brNewDeal(){
+  BR.seq++;
+  BR.board++;
+  BR.dealer = BR.board===1 ? 0 : (BR.dealer+1)%4;
+  const deck=[]; for(let c=0;c<52;c++) deck.push(c);
+  for(let i=51;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [deck[i],deck[j]]=[deck[j],deck[i]]; }
+  BR.seats.forEach((st,s)=>{ st.hand=deck.slice(s*13,s*13+13); brSortHand(st.hand);
+    st.voids=[false,false,false,false]; });
+  BR.vuln=[BR.rub.games[0]>=1, BR.rub.games[1]>=1];
+  BR.stage="auction"; BR.auction=[]; BR.contract=null; BR.declarer=-1; BR.dummy=-1;
+  BR.turn=BR.dealer; BR.leader=-1; BR.trick=[]; BR.playedBy=[[],[],[],[]];
+  BR.tricks=[0,0]; BR.trickHist=[]; BR.lastTrick=null; BR.dummyShown=false;   // 永遠 false：沒有明手
+  BR.handOver=false; BR.result=null; BR.phase="play";
+  brBanner("第 "+BR.board+" 副 · 發牌者 "+brName(BR.dealer)+" 開叫｜Board "+BR.board+" — "+BSEATS[BR.dealer]+" deals");
+  broadcast();
+  brStep();
+}
+
+/* ---------- auction ---------- */
+function brBidVal(b){ return b.lvl*5+b.str; }
+function brLastBid(){ for(let i=BR.auction.length-1;i>=0;i--) if(BR.auction[i].t==="B") return BR.auction[i]; return null; }
+function brLastNonPass(){ for(let i=BR.auction.length-1;i>=0;i--) if(BR.auction[i].t!=="P") return BR.auction[i]; return null; }
+function brDblState(){ const n=brLastNonPass(); if(!n) return 0; if(n.t==="XX") return 2; if(n.t==="X") return 1; return 0; }
+function brCanCall(seat,call){
+  if(BR.stage!=="auction") return false;
+  if(call.t==="P") return true;
+  const lb=brLastBid(), ln=brLastNonPass();
+  if(call.t==="B") return !lb || brBidVal(call)>brBidVal(lb);
+  if(call.t==="X") return !!ln && ln.t==="B" && (ln.seat%2)!==(seat%2);
+  if(call.t==="XX") return !!ln && ln.t==="X" && (ln.seat%2)!==(seat%2);
+  return false;
+}
+function brLegalCalls(seat){
+  const out={pass:true,dbl:brCanCall(seat,{t:"X"}),rdbl:brCanCall(seat,{t:"XX"}),bids:[]};
+  const lb=brLastBid(); const floor=lb? brBidVal(lb) : 0;
+  for(let l=1;l<=7;l++) for(let st=0;st<5;st++) if(l*5+st>floor) out.bids.push(l*5+st);
+  return out;
+}
+function brCall(seat,call){
+  if(!brCanCall(seat,call)) return false;
+  call={t:call.t,lvl:call.lvl,str:call.str,seat:seat};   // never share the PASS/DBL singletons
+  BR.auction.push(call);
+  brBanner(BSEATS[seat]+" "+brCallStr(call));
+  const n=BR.auction.length;
+  const bids=BR.auction.filter(c=>c.t!=="P").length;
+  if(n>=4 && BR.auction.slice(-3).every(c=>c.t==="P") && bids>0){ brAuctionEnd(); return true; }
+  if(n===4 && bids===0){ brBanner("四家全 Pass — 重新發牌｜Passed out — redeal");
+    BR.handOver=true; BR.stage="over"; BR.result={passedOut:true}; broadcast(); return true; }
+  BR.turn=(seat+1)%4; broadcast(); brStep(); return true;
+}
+function brCallStr(c){ return c.t==="P"?"Pass":c.t==="X"?"X (Double)":c.t==="XX"?"XX (Redouble)":(c.lvl+BSTRAIN[c.str]); }
+function brAuctionEnd(){
+  const lb=brLastBid(); const dbl=brDblState();
+  const side=lb.seat%2;
+  let dec=-1;
+  for(const c of BR.auction) if(c.t==="B" && (c.seat%2)===side && c.str===lb.str){ dec=c.seat; break; }
+  BR.contract={lvl:lb.lvl,str:lb.str,dbl,declarer:dec};
+  BR.declarer=dec; BR.dummy=(dec+2)%4;
+  BR.stage="play"; BR.leader=(dec+1)%4; BR.turn=BR.leader; BR.trick=[];
+  brBanner("定約 "+brContractShort()+" · 莊家 "+brName(dec)+"（"+BSEATS[dec]+"）· "+BSEATS[BR.leader]+" 首攻 · 四家各打各的牌，不攤明手"
+    +"｜Contract "+brContractShort()+" by "+BSEATS[dec]+", "+BSEATS[BR.leader]+" leads");
+  broadcast(); brStep();
+}
+function brContractShort(){ const c=BR.contract; if(!c) return "—";
+  return c.lvl+BSTRAIN[c.str]+(c.dbl===1?" X":c.dbl===2?" XX":""); }
+function brContractStr(){ const c=BR.contract; if(!c) return "—";
+  return brContractShort()+" by "+BSEATS[c.declarer]; }
+
+/* ---------- play ---------- */
+function brLegalCards(seat){
+  const h=BR.seats[seat].hand;
+  if(BR.trick.length===0) return h.slice();
+  const led=cSuit(BR.trick[0].card);
+  const f=h.filter(c=>cSuit(c)===led);
+  return f.length? f : h.slice();
+}
+function brTrickWinner(cards,trumpSuit){
+  const led=cSuit(cards[0].card); let best=cards[0];
+  for(const x of cards.slice(1)){
+    const bs=cSuit(best.card), xs=cSuit(x.card);
+    if(trumpSuit>=0 && xs===trumpSuit && bs!==trumpSuit) best=x;
+    else if(xs===bs && cRank(x.card)>cRank(best.card)) best=x;
+  }
+  return best.seat;
+}
+function brTrumpSuit(){ const c=BR.contract; return c.str===4? -1 : ST2SU[c.str]; }
+function brPlay(seat,card){
+  if(BR.stage!=="play"||BR.handOver) return false;
+  if(BR.turn!==seat) return false;
+  const legal=brLegalCards(seat);
+  if(!legal.includes(card)) return false;
+  const st=BR.seats[seat];
+  // void inference for the bots' sampler
+  if(BR.trick.length){ const led=cSuit(BR.trick[0].card); if(cSuit(card)!==led) st.voids[led]=true; }
+  st.hand=st.hand.filter(c=>c!==card);
+  BR.playedBy[seat].push(card);
+  BR.trick.push({seat,card});
+  if(BR.trick.length===4){
+    const w=brTrickWinner(BR.trick,brTrumpSuit());
+    BR.tricks[w%2]++;
+    BR.trickHist.push({cards:BR.trick.slice(),win:w});
+    BR.lastTrick={cards:BR.trick.slice(),win:w};
+    BR.trick=[]; BR.leader=w; BR.turn=w;
+    brBanner("第 "+BR.trickHist.length+" 墩 "+BSEATS[w]+" 贏｜Trick "+BR.trickHist.length+" to "+BSEATS[w]
+      +"  (NS "+BR.tricks[0]+" – EW "+BR.tricks[1]+")");
+    broadcast();
+    if(BR.trickHist.length===13){ brLater(700,brFinishHand); return true; }
+    brLater(750,brStep); return true;
+  }
+  BR.turn=(seat+1)%4; broadcast(); brStep(); return true;
+}
+/* 盧家桌規：每個人只出自己的牌 —— 沒有人幫別人出 */
+function brController(seat){ return seat; }
+function brStep(){
+  if(BR.handOver||BR.phase!=="play") return;
+  const s=BR.turn;
+  if(BR.stage==="auction"){
+    if(brIsBot(s)) brLater(900,()=>{ if(BR.turn===s&&BR.stage==="auction") brCall(s,brAIBid(s)); });
+    return;
+  }
+  if(BR.stage!=="play") return;
+  const ctrl=brController(s);
+  if(brIsBot(ctrl)) brLater(BR.trick.length===0?600:450,()=>{ if(BR.turn===s&&BR.stage==="play"&&!BR.handOver){
+    const c=brAIPlay(s); if(c!==undefined&&c!==null) brPlay(s,c); }});
+}
+function brResumeAuto(s){ if(BR.stage==="auction"){ if(BR.turn===s) brStep(); }
+  else if(BR.stage==="play"){ if(brController(BR.turn)===s) brStep(); } }
+
+/* 沒有明手可以攤，所以也沒有「攤牌宣告」這回事 —— 十三墩老老實實打完。 */
+function brClaim(){ return {error:"這桌沒有明手，不能攤牌 — 打完十三墩｜No dummy at this table, so there is nothing to claim."}; }
+
+/* ---------- scoring: RUBBER BRIDGE ---------- */
+function brHonours(){
+  const c=BR.contract; const out=[];
+  const side=brSide(c.declarer);
+  for(let s=0;s<4;s++){
+    const orig=BR.seats[s].hand.concat(BR.playedBy[s]);
+    if(c.str===4){
+      const aces=orig.filter(x=>cRank(x)===12).length;
+      if(aces===4) out.push({seat:s,pts:150,txt:"四張 A（無王）· 4 aces at NT"});
+    } else {
+      const t=ST2SU[c.str];
+      const hon=orig.filter(x=>cSuit(x)===t&&cRank(x)>=8).length;   // 10,J,Q,K,A
+      if(hon===5) out.push({seat:s,pts:150,txt:"五張大牌 A K Q J 10 · 5 trump honours"});
+      else if(hon===4) out.push({seat:s,pts:100,txt:"四張大牌 · 4 trump honours"});
+    }
+  }
+  return out;
+}
+function brScoreHand(){
+  const c=BR.contract, side=brSide(c.declarer), opp=1-side;
+  const vul=BR.vuln[side];
+  const won=BR.tricks[side], need=c.lvl+6, res=won-need;
+  const mult=c.dbl===1?2:c.dbl===2?4:1;
+  const per=(c.str<=1)?20:(c.str<=3)?30:30;
+  let below=0, aboveDec=0, aboveOpp=0, lines=[];
+  if(res>=0){
+    below=(c.str===4 ? 40+30*(c.lvl-1) : per*c.lvl)*mult;
+    lines.push({k:"合約墩分 Contract tricks",v:below,side});
+    if(res>0){
+      let ot;
+      if(c.dbl===0) ot=res*(c.str===4?30:per);
+      else ot=res*(vul?200:100)*(c.dbl===2?2:1);
+      aboveDec+=ot; lines.push({k:"超墩 Overtricks ×"+res,v:ot,side});
+    }
+    if(c.dbl>0){ const ins=c.dbl===1?50:100; aboveDec+=ins; lines.push({k:"加倍成約獎 Insult",v:ins,side}); }
+    if(c.lvl===6){ const b=vul?750:500; aboveDec+=b; lines.push({k:"小滿貫 Small slam",v:b,side}); }
+    if(c.lvl===7){ const b=vul?1500:1000; aboveDec+=b; lines.push({k:"大滿貫 Grand slam",v:b,side}); }
+  } else {
+    const n=-res; let pen;
+    if(c.dbl===0) pen=n*(vul?100:50);
+    else { pen = vul ? 200+300*(n-1)
+                     : 100 + (n>=2?200:0) + (n>=3?200:0) + Math.max(0,n-3)*300;
+           if(c.dbl===2) pen*=2; }
+    aboveOpp+=pen; lines.push({k:"罰分 Down "+n,v:pen,side:opp});
+  }
+  brHonours().forEach(h=>{ const hs=brSide(h.seat);
+    if(hs===side) aboveDec+=h.pts; else aboveOpp+=h.pts;
+    lines.push({k:"榮牌 Honours ("+BSEATS[h.seat]+") "+h.txt,v:h.pts,side:hs}); });
+
+  const R=BR.rub;
+  R.above[side]+=aboveDec; R.above[opp]+=aboveOpp;
+  R.total[side]+=aboveDec; R.total[opp]+=aboveOpp;
+  let gameWon=null, rubberWon=null, rubBonus=0;
+  if(below>0){
+    R.below[side]+=below; R.total[side]+=below;
+    if(R.below[side]>=100){
+      gameWon=side; R.games[side]++; R.below=[0,0];
+      if(R.games[side]===2){
+        rubberWon=side; rubBonus = R.games[opp]===0?700:500;
+        R.above[side]+=rubBonus; R.total[side]+=rubBonus; R.rubbers[side]++;
+      }
+    }
+  }
+  BR.result={ made:res>=0, res, need, won, lines, below, aboveDec, aboveOpp,
+              gameWon, rubberWon, rubBonus, contract:brContractStr(), declarer:c.declarer };
+  R.hist.unshift({board:BR.board, contract:brContractStr(), res, ns:R.total[0], ew:R.total[1]});
+  R.hist=R.hist.slice(0,12);
+  if(rubberWon!==null){ R.games=[0,0]; R.below=[0,0]; }
+  // scoreboard on the player objects
+  BR.seats.forEach((st,s)=>{ const p=brSeatP(s); if(p) p.brScore=R.total[brSide(s)]; });
+}
+/* Law 61 — unfinished rubber: 300 for a game won, 100 for a part-score in the unfinished game */
+function brEndRubber(){
+  const R=BR.rub; const lines=[];
+  for(let sd=0;sd<2;sd++){
+    if(R.games[sd]===1){ R.above[sd]+=300; R.total[sd]+=300; lines.push({k:"未完成局盤 · 已得一盤 Unfinished rubber (game)",v:300,side:sd}); }
+    if(R.below[sd]>0){ R.above[sd]+=100; R.total[sd]+=100; lines.push({k:"未完成局盤 · 部分分 Part-score",v:100,side:sd}); }
+  }
+  R.games=[0,0]; R.below=[0,0];
+  BR.vuln=[false,false];
+  const w = R.total[0]===R.total[1] ? -1 : (R.total[0]>R.total[1]?0:1);
+  brBanner("局盤結算：N/S "+R.total[0]+" — E/W "+R.total[1]
+    +(w<0?"　平手 tie":"　★ "+(w===0?"N/S":"E/W")+" 領先")+"｜Rubber closed out.");
+  BR.result=Object.assign({},BR.result||{},{endRubber:lines});
+  broadcast();
+  return lines;
+}
+function brFinishHand(){
+  if(BR.handOver) return;
+  if(BR.contract) brScoreHand();
+  BR.handOver=true; BR.stage="over";
+  const r=BR.result;
+  if(r&&BR.contract) brBanner(brContractStr()+(r.made?(r.res===0?" 剛好成約 made exactly":" 成約 +"+r.res):" 倒 "+(-r.res)+" 墩 down "+(-r.res))
+    +(r.rubberWon!==null?"　★ "+(r.rubberWon===0?"N/S":"E/W")+" 贏得一局盤 RUBBER!":(r.gameWon!==null?"　★ "+(r.gameWon===0?"N/S":"E/W")+" 拿下一盤 GAME":"")));
+  broadcast();
+}
+
+/* ================= BOT BIDDING — SAYC ================= */
+function brSupportPts(h,trump,asDummy){
+  const l=brShape(h); let p=brHcp(h);
+  if(asDummy){ [0,1,2,3].forEach(s=>{ if(s===trump) return;
+    if(l[s]===0) p+=5; else if(l[s]===1) p+=3; else if(l[s]===2) p+=1; }); }
+  else { [0,1,2,3].forEach(s=>{ if(l[s]>=5) p+=l[s]-4; }); }
+  return p;
+}
+function brQuickTricks(h,s){ const c=brSuitCards(h,s).map(cRank);
+  let q=0; const has=r=>c.includes(r);
+  if(has(12)&&has(11)) q=2; else if(has(12)&&has(10)) q=1.5; else if(has(12)) q=1;
+  else if(has(11)&&has(10)) q=1; else if(has(11)&&c.length>=2) q=0.5;
+  return q; }
+function brSuitQual(h,s){ const c=brSuitCards(h,s).map(cRank);
+  return c.length + c.filter(r=>r>=10).length + (c.filter(r=>r>=8).length>=2?1:0); }
+function brLongest(l,onlyMajor){ let best=-1,bl=0;
+  for(let s=0;s<4;s++){ if(onlyMajor&&s>1) continue; if(l[s]>bl||(l[s]===bl&&s<best)){ bl=l[s]; best=s; } }
+  return best; }
+function brBid(l,st){ return {t:"B",lvl:l,str:st}; }
+const PASS={t:"P"}, DBL={t:"X"}, RDBL={t:"XX"};
+
+function brCtx(seat){
+  const a=BR.auction;
+  const mine=a.filter(c=>c.seat===seat), pard=a.filter(c=>c.seat===(seat+2)%4);
+  const lho=a.filter(c=>c.seat===(seat+1)%4), rho=a.filter(c=>c.seat===(seat+3)%4);
+  const bids=a.filter(c=>c.t==="B");
+  const first=bids.length? bids[0] : null;
+  return { a, mine, pard, lho, rho, bids, first,
+    lastBid:brLastBid(), lastNP:brLastNonPass(),
+    weOpened: !!first && (first.seat%2)===(seat%2),
+    iOpened: !!first && first.seat===seat,
+    pardOpened: !!first && first.seat===(seat+2)%4,
+    oppOpened: !!first && (first.seat%2)!==(seat%2),
+    myBids: mine.filter(c=>c.t==="B"), pardBids: pard.filter(c=>c.t==="B"),
+    oppBid: bids.some(c=>(c.seat%2)!==(seat%2)),
+    pardDbl: pard.some(c=>c.t==="X"),
+    rhoBid: rho.length? rho[rho.length-1] : null,
+    lhoBid: lho.length? lho[lho.length-1] : null };
+}
+function brSafe(call,seat){ return brCanCall(seat,call)? call : PASS; }
+
+/* --- opening --- */
+function brOpening(h,seat){
+  const l=brShape(h), hcp=brHcp(h), pts=brSupportPts(h,-1,false);
+  const bal=brBalanced(l);
+  const qt=[0,1,2,3].reduce((a,s)=>a+brQuickTricks(h,s),0);
+  const posn=(seat-BR.dealer+4)%4;                     // 0 = first seat
+  // 2C strong
+  if(hcp>=22 || (hcp>=19 && qt>=4.5 && l.some(x=>x>=6))) return brBid(2,0);
+  if(bal){
+    if(hcp>=15&&hcp<=17) return brBid(1,4);
+    if(hcp>=20&&hcp<=21) return brBid(2,4);
+  }
+  const rule20 = hcp + l[brLongest(l,false)] + [...l].sort((a,b)=>b-a)[1];
+  const open = hcp>=14 || (hcp>=12&&rule20>=20&&qt>=2) || (hcp>=13&&qt>=2);
+  if(open){
+    if(l[0]>=5&&l[0]>=l[1]) return brBid(1,SU2ST[0]);
+    if(l[1]>=5&&l[1]>l[0]) return brBid(1,SU2ST[1]);
+    if(l[0]>=5) return brBid(1,SU2ST[0]);
+    if(l[1]>=5) return brBid(1,SU2ST[1]);
+    if(l[2]>=l[3]&&l[2]>=4) return brBid(1,1);
+    if(l[3]>=4) return brBid(1,0);
+    if(l[2]>l[3]) return brBid(1,1);
+    return brBid(1,0);                                  // 3-3 minors -> 1C
+  }
+  // preempts (not in 4th seat with a weak hand)
+  if(posn<3||hcp>=11){
+    for(let s=0;s<4;s++){
+      const q=brSuitQual(h,s);
+      if(l[s]===6&&hcp>=5&&hcp<=11&&q>=8&&s!==3&&!(l[0]>=4&&s!==0)) return brBid(2,SU2ST[s]);
+      if(l[s]===7&&hcp>=5&&hcp<=11&&q>=8) return brBid(3,SU2ST[s]);
+      if(l[s]>=8&&hcp<=11&&q>=9) return brBid(4,SU2ST[s]);
+    }
+  }
+  return PASS;
+}
+/* --- responses to 1NT --- */
+function brRespond1NT(h,seat,ctx){
+  const l=brShape(h), hcp=brHcp(h);
+  if(BR.auction.filter(c=>c.t!=="P").length>1) return brCompetitive(h,seat,ctx); // interference
+  if(l[0]>=5) return brBid(2,SU2ST[1]);                 // transfer to spades = 2H
+  if(l[1]>=5) return brBid(2,SU2ST[2]);                 // transfer to hearts = 2D
+  if(hcp>=8&&(l[0]===4||l[1]===4)) return brBid(2,0);   // Stayman
+  if(hcp<=7) return PASS;
+  if(hcp<=9) return brBid(2,4);
+  if(hcp<=15) return brBid(3,4);
+  if(hcp<=17) return brBid(4,4);                        // quantitative
+  return brBid(4,0);                                     // Gerber
+}
+/* --- responses to a 1-of-suit opening --- */
+function brRespondSuit(h,seat,ctx,op){
+  const l=brShape(h), hcp=brHcp(h);
+  const os=ST2SU[op.str], major=os<=1;
+  const sup=brSupportPts(h,os,true);
+  const fit = major ? l[os]>=3 : l[os]>=4;
+  if(hcp<6 && !(l[os]>=5&&hcp>=5)) return PASS;
+  if(fit&&major){
+    if(sup>=13) return brBid(4,op.str);                  // or splinter; keep it sound
+    if(sup>=11) return brBid(3,op.str);                  // limit raise
+    if(sup>=6) return brBid(2,op.str);
+  }
+  // new suit at the 1 level: longest first, ties bid up the line
+  if(hcp>=6){
+    const cand=[0,1,2,3].filter(s=>l[s]>=4 && SU2ST[s]>op.str)
+      .sort((x,y)=> l[y]-l[x] || SU2ST[x]-SU2ST[y]);
+    if(cand.length) return brBid(1,SU2ST[cand[0]]);
+  }
+  if(hcp>=6&&hcp<=10&&!fit) return brBid(1,4);
+  if(hcp>=11){
+    const s=brLongest(l,false);
+    if(l[s]>=4&&SU2ST[s]!==op.str) return brSafe(brBid(2,SU2ST[s]),seat);
+    if(hcp>=13) return brBid(3,4);
+    return brBid(2,4);
+  }
+  if(fit&&!major&&hcp>=6) return brBid(2,op.str);
+  return PASS;
+}
+/* --- opener's rebid --- */
+function brOpenerRebid(h,seat,ctx){
+  const l=brShape(h), hcp=brHcp(h), pts=brSupportPts(h,-1,false);
+  const op=ctx.myBids[0], resp=ctx.pardBids[ctx.pardBids.length-1];
+  const pardPassed=ctx.pard.length&&ctx.pard[ctx.pard.length-1].t==="P";
+  if(!resp) { if(pardPassed) return PASS; return brCompetitive(h,seat,ctx); }
+  const rs=resp.str===4?-1:ST2SU[resp.str];
+  // partner raised our suit
+  if(resp.str===op.str){
+    const maj = op.str===2||op.str===3;
+    if(resp.lvl===2){ if(pts>=17) return brSafe(brBid(maj?4:3,op.str),seat);
+                      if(pts>=15) return brSafe(brBid(3,op.str),seat); return PASS; }
+    if(resp.lvl===3){ if(pts>=13&&maj) return brSafe(brBid(4,op.str),seat);
+                      if(pts>=16) return brSafe(brBid(maj?4:5,op.str),seat); return PASS; }
+    return PASS;
+  }
+  // partner bid 1NT
+  if(resp.str===4){
+    if(resp.lvl===1){ if(pts>=18) return brSafe(brBid(2,4),seat);
+      if(l[ST2SU[op.str]]>=6&&pts>=15) return brSafe(brBid(2,op.str),seat); return PASS; }
+    if(resp.lvl===2){ if(pts>=13) return brSafe(brBid(3,4),seat); return PASS; }
+    if(resp.lvl===3) return PASS;
+  }
+  // partner bid a new suit
+  if(rs>=0&&l[rs]>=4){
+    const lvl = (SU2ST[rs]>op.str && resp.lvl===1) ? (pts>=17?3:2) : (pts>=17?4:3);
+    if(rs<=1){ if(pts>=19) return brSafe(brBid(4,SU2ST[rs]),seat);
+               if(pts>=16) return brSafe(brBid(3,SU2ST[rs]),seat);
+               return brSafe(brBid(resp.lvl===1?2:3,SU2ST[rs]),seat); }
+  }
+  if(l[ST2SU[op.str]]>=6){ if(pts>=17) return brSafe(brBid(3,op.str),seat);
+                           return brSafe(brBid(2,op.str),seat); }
+  if(brBalanced(l)){ if(pts>=18) return brSafe(brBid(2,4),seat);
+    if(resp.lvl===1) return brSafe(brBid(1,4),seat); return brSafe(brBid(2,4),seat); }
+  // second suit
+  for(let s=0;s<4;s++) if(l[s]>=4&&s!==ST2SU[op.str]&&s!==rs){
+    const b=brBid(resp.lvl===1?(SU2ST[s]>op.str?1:2):2,SU2ST[s]);
+    if(brCanCall(seat,b)) return b;
+  }
+  return PASS;
+}
+/* --- overcalls, takeout doubles, competitive --- */
+function brCompetitive(h,seat,ctx){
+  const l=brShape(h), hcp=brHcp(h);
+  const lb=ctx.lastBid;
+  const oppOwns = lb && (lb.seat%2)!==(seat%2);
+  const weOwn   = lb && (lb.seat%2)===(seat%2);
+  // partner made a takeout double -> advance
+  if(ctx.pardDbl && ctx.myBids.length===0 && oppOwns){
+    const s=brLongest(l,false);
+    const lvl = lb.lvl + ((SU2ST[s]>lb.str)?0:1);
+    if(hcp>=11) return brSafe(brBid(Math.min(7,lvl+1),SU2ST[s]),seat);
+    if(hcp>=9&&brBalanced(l)) return brSafe(brBid(lb.lvl+1,4),seat);
+    return brSafe(brBid(lvl,SU2ST[s]),seat);
+  }
+  if(weOwn){
+    // partner has the contract: raise with a fit and extra shape, else pass
+    const ourLast=ctx.pardBids[ctx.pardBids.length-1]||ctx.myBids[ctx.myBids.length-1];
+    if(ourLast&&ourLast.str<4&&l[ST2SU[ourLast.str]]>=3&&hcp>=10&&lb.lvl<4)
+      return brSafe(brBid(lb.lvl+1,lb.str),seat);
+    return PASS;
+  }
+  if(!oppOwns) return PASS;
+  // takeout double
+  const oppS = lb.str===4?-1:ST2SU[lb.str];
+  if(ctx.myBids.length===0 && brBalanced(l) && hcp>=15 && hcp<=18 && lb.str<4 && l[ST2SU[lb.str]]>=1){
+    const nt=brBid(lb.lvl,4); if(brCanCall(seat,nt)) return nt;
+  }
+  const shortOpp = oppS>=0 && l[oppS]<=2;
+  const support = oppS>=0 && [0,1,2,3].every(s=> s===oppS || l[s]>=3);
+  if(lb.lvl<=2 && hcp>=12 && shortOpp && support && ctx.myBids.length===0 && !ctx.mine.some(c=>c.t==="X"))
+    return brSafe(DBL,seat);
+  // simple overcall
+  if(ctx.myBids.length===0){
+    for(let s=0;s<4;s++){
+      if(l[s]<5) continue;
+      const q=brSuitQual(h,s);
+      const one=brBid(1,SU2ST[s]), two=brBid(2,SU2ST[s]);
+      if(brCanCall(seat,one)&&hcp>=8&&hcp<=17&&q>=7) return one;
+      if(brCanCall(seat,two)&&hcp>=11&&hcp<=17&&q>=8) return two;
+      if(l[s]>=6&&hcp>=6&&hcp<=10&&q>=8){
+        const jump=brBid(lb.lvl+(SU2ST[s]>lb.str?1:2),SU2ST[s]);
+        if(brCanCall(seat,jump)&&jump.lvl<=3) return jump;
+      }
+    }
+    if(brBalanced(l)&&hcp>=15&&hcp<=18&&oppS>=0&&l[oppS]>=1){
+      const nt=brBid(lb.lvl,4); if(brCanCall(seat,nt)) return nt;
+    }
+  }
+  // penalty double of a high contract with defence
+  if(lb.lvl>=4&&hcp>=15&&brCanCall(seat,DBL)&&ctx.myBids.length===0) return DBL;
+  return PASS;
+}
+/* --- Blackwood / slam --- */
+function brAcesCount(h){ return h.filter(c=>cRank(c)===12).length; }
+function brKingsCount(h){ return h.filter(c=>cRank(c)===11).length; }
+function brBlackwoodAnswer(h,seat){
+  const a=brAcesCount(h);
+  const step=[0,1,2,3,4][a>=4?0:a];                     // 5C=0 or 4, 5D=1, 5H=2, 5S=3
+  const map=[0,1,2,3];                                   // strain for 5C/5D/5H/5S
+  return brBid(5, map[a>=4?0:a]);
+}
+function brAIBid(seat){
+  const h=BR.seats[seat].hand, ctx=brCtx(seat);
+  const l=brShape(h), hcp=brHcp(h);
+  try{
+    // ---- answering Blackwood 4NT / Gerber 4C from partner ----
+    const pl=ctx.pardBids[ctx.pardBids.length-1];
+    if(pl&&pl.lvl===4&&pl.str===4&&ctx.bids.length>=3){ const r=brBlackwoodAnswer(h,seat); if(brCanCall(seat,r)) return r; }
+    if(pl&&pl.lvl===4&&pl.str===0&&ctx.pardBids.length>=2&&ctx.pardBids[0].str===4){
+      const a=brAcesCount(h); const r=brBid(4,[1,2,3,4][a>=4?0:a]); if(brCanCall(seat,r)) return r; }
+    // ---- responding to partner's Blackwood answer: place the contract ----
+    if(ctx.myBids.length&&ctx.myBids[ctx.myBids.length-1].lvl===4&&ctx.myBids[ctx.myBids.length-1].str===4&&pl&&pl.lvl===5){
+      const aces=[0,1,2,3].indexOf(pl.str); const mine=brAcesCount(h);
+      const trump=ctx.myBids.length>=2? ctx.myBids[ctx.myBids.length-2].str : 4;
+      const tot=mine+(aces<0?0:aces);
+      if(tot>=3&&hcp>=17) return brSafe(brBid(6,trump),seat);
+      return brSafe(brBid(5,trump),seat);
+    }
+    // ---- 1NT opener answering Stayman / completing a Jacoby transfer ----
+    if(ctx.iOpened && ctx.myBids.length===1 && ctx.myBids[0].lvl===1 && ctx.myBids[0].str===4 && pl && pl.lvl===2){
+      if(pl.str===1){ const b=brBid(2,2); if(brCanCall(seat,b)) return b; }        // 2D -> 2H
+      if(pl.str===2){ const b=brBid(2,3); if(brCanCall(seat,b)) return b; }        // 2H -> 2S
+      if(pl.str===0){                                                              // Stayman
+        if(l[0]>=4) return brSafe(brBid(2,3),seat);
+        if(l[1]>=4) return brSafe(brBid(2,2),seat);
+        return brSafe(brBid(2,1),seat);
+      }
+      if(pl.str===4) return hcp>=17? brSafe(brBid(3,4),seat) : PASS;               // 2NT invite
+    }
+    // ---- responder after a completed transfer ----
+    if(ctx.pardOpened && ctx.pardBids[0] && ctx.pardBids[0].lvl===1 && ctx.pardBids[0].str===4
+       && ctx.myBids.length===1 && ctx.myBids[0].lvl===2 && (ctx.myBids[0].str===1||ctx.myBids[0].str===2)){
+      const maj = ctx.myBids[0].str===1 ? 1 : 0;                                   // suit index
+      if(hcp<=7) return PASS;
+      if(hcp<=9) return brSafe(brBid(3,SU2ST[maj]),seat);
+      if(l[maj]>=6) return brSafe(brBid(4,SU2ST[maj]),seat);
+      if(hcp>=10) return brSafe(brBid(3,4),seat);
+      return PASS;
+    }
+    // ---- responder after a Stayman answer ----
+    if(ctx.pardOpened && ctx.pardBids[0] && ctx.pardBids[0].lvl===1 && ctx.pardBids[0].str===4
+       && ctx.myBids.length===1 && ctx.myBids[0].lvl===2 && ctx.myBids[0].str===0 && pl && pl.lvl===2){
+      const ans = pl.str===3?0 : pl.str===2?1 : -1;
+      if(ans>=0 && l[ans]>=4){ if(hcp>=10) return brSafe(brBid(4,SU2ST[ans]),seat);
+                               return brSafe(brBid(3,SU2ST[ans]),seat); }
+      if(hcp>=10) return brSafe(brBid(3,4),seat);
+      return brSafe(brBid(2,4),seat);
+    }
+    // ---- 2C opener's rebid ----
+    if(ctx.iOpened&&ctx.myBids.length===1&&ctx.myBids[0].lvl===2&&ctx.myBids[0].str===0){
+      if(brBalanced(l)) return brSafe(brBid(2,4),seat);
+      const s=brLongest(l,false); return brSafe(brBid(2,SU2ST[s]),seat);
+    }
+    // ---- nobody has bid: open ----
+    if(!ctx.first) return brOpening(h,seat);
+    // ---- partner opened, opponents silent-ish, my first call ----
+    if(ctx.pardOpened&&ctx.myBids.length===0&&ctx.pardBids.length===1){
+      const op=ctx.pardBids[0];
+      if(ctx.oppBid&&brLastBid()&&(brLastBid().seat%2)!==(seat%2)){
+        // negative double with both majors / values
+        if(op.lvl===1&&brLastBid().lvl<=2&&hcp>=8&&op.str<4){
+          const os=ST2SU[op.str], ov=ST2SU[brLastBid().str];
+          const oth=[0,1].filter(s=>s!==os&&s!==ov);
+          if(oth.some(s=>l[s]>=4)&&brCanCall(seat,DBL)) return DBL;
+        }
+        return brCompetitive(h,seat,ctx);
+      }
+      if(op.str===4&&op.lvl===1) return brRespond1NT(h,seat,ctx);
+      if(op.str===4&&op.lvl===2){ if(hcp>=5) return brSafe(brBid(3,4),seat); return PASS; }
+      if(op.lvl===2&&op.str===0){ if(hcp>=8) return brSafe(brBid(2,2),seat); return brSafe(brBid(2,1),seat); } // 2D waiting
+      if(op.lvl>=2&&op.str<4){                                    // partner preempted
+        const os=ST2SU[op.str];
+        if(l[os]>=3&&hcp>=15) return brSafe(brBid(op.lvl+1,op.str),seat);
+        if(hcp>=17&&brBalanced(l)) return brSafe(brBid(3,4),seat);
+        return PASS;
+      }
+      return brRespondSuit(h,seat,ctx,op);
+    }
+    // ---- I opened, partner has responded ----
+    if(ctx.iOpened&&ctx.myBids.length>=1&&ctx.pardBids.length>=1) return brOpenerRebid(h,seat,ctx);
+    // ---- responder's rebid ----
+    if(ctx.pardOpened&&ctx.myBids.length>=1&&ctx.pardBids.length>=2){
+      const op=ctx.pardBids[0], reb=ctx.pardBids[ctx.pardBids.length-1];
+      const lb=ctx.lastBid;
+      if(lb&&(lb.seat%2)===(seat%2)){
+        const trump=reb.str;
+        const fitS=trump===4?-1:ST2SU[trump];
+        const pts=brSupportPts(h,fitS,true);
+        // slam try
+        if(pts>=17&&fitS>=0&&l[fitS]>=3&&lb.lvl<=4&&brCanCall(seat,brBid(4,4))) return brBid(4,4);
+        if(lb.lvl>=4) return PASS;
+        if(fitS>=0&&l[fitS]>=3&&pts>=12) return brSafe(brBid(fitS<=1?4:5,trump),seat);
+        if(pts>=12&&brBalanced(l)) return brSafe(brBid(3,4),seat);
+        if(pts>=13){ const b=brBid(3,4); if(brCanCall(seat,b)) return b; }
+        return PASS;
+      }
+      return brCompetitive(h,seat,ctx);
+    }
+    // ---- everything else ----
+    return brCompetitive(h,seat,ctx);
+  }catch(e){ return PASS; }
+}
+
+/* ================= BOT CARD PLAY — Monte-Carlo double dummy ================= */
+let DD_NODES=0, DD_BUDGET=250000, DD_T0=0, DD_MS=400, DD_ABORT=false;
+const BR_THINK = parseInt(process.env.BR_THINK||"400");
+function ddMoves(hand,led){
+  let m = led<0 ? hand : hand.filter(c=>cSuit(c)===led);
+  if(!m.length) m=hand;
+  m=m.slice().sort((a,b)=> cSuit(a)-cSuit(b) || cRank(b)-cRank(a));
+  // collapse touching cards in the same suit (equivalent plays)
+  const out=[];
+  for(let i=0;i<m.length;i++){
+    if(i>0 && cSuit(m[i])===cSuit(m[i-1]) && cRank(m[i-1])-cRank(m[i])===1) continue;
+    out.push(m[i]);
+  }
+  return out;
+}
+function ddLeaf(hands,trump,decSide,turn){
+  const total=hands[turn].length;
+  if(!total) return 0;
+  let dec=0,opp=0;
+  for(let s=0;s<4;s++){
+    let topR=-1,topP=-1;
+    for(let p=0;p<4;p++){ const h=hands[p];
+      for(let i=0;i<h.length;i++){ const c=h[i];
+        if(((c/13)|0)!==s) continue;
+        const r=c%13; if(r>topR){ topR=r; topP=p; } } }
+    if(topP<0) continue;
+    if(topR>=11){ if((topP%2)===decSide) dec++; else opp++; }
+  }
+  if(trump>=0){
+    let dt=0,ot=0;
+    for(let p=0;p<4;p++){ let n=0; const h=hands[p];
+      for(let i=0;i<h.length;i++) if(((h[i]/13)|0)===trump) n++;
+      if((p%2)===decSide){ if(n>dt) dt=n; } else if(n>ot) ot=n; }
+    if(dt>ot) dec+=(dt-ot)*0.6; else opp+=(ot-dt)*0.6;
+  }
+  const rest=Math.max(0,total-dec-opp);
+  return Math.min(total, dec+rest*0.45);
+}
+function ddRec(hands,trump,turn,trick,decSide,depth,alpha,beta){
+  if(((++DD_NODES)&255)===0 && Date.now()-DD_T0>DD_MS) DD_ABORT=true;
+  if(DD_ABORT) return 0;
+  if(trick.length===0 && (depth<=0 || hands[turn].length===0)) return ddLeaf(hands,trump,decSide,turn);
+  const maxing=(turn%2)===decSide;
+  const moves=ddMoves(hands[turn], trick.length? ((trick[0].card/13)|0) : -1);
+  let best = maxing? -1 : 99;
+  for(let mi=0;mi<moves.length;mi++){
+    const c=moves[mi];
+    const h=hands[turn]; const idx=h.indexOf(c); h.splice(idx,1);
+    trick.push({seat:turn,card:c});
+    let val;
+    if(trick.length===4){
+      const w=brTrickWinner(trick,trump);
+      const gain=((w%2)===decSide)?1:0;
+      const saved=trick.splice(0,4);
+      val=gain+ddRec(hands,trump,w,trick,decSide,depth-1,alpha-gain,beta-gain);
+      for(let i=0;i<4;i++) trick.push(saved[i]);
+    } else {
+      val=ddRec(hands,trump,(turn+1)%4,trick,decSide,depth,alpha,beta);
+    }
+    trick.pop(); h.splice(idx,0,c);
+    if(DD_ABORT) return 0;
+    if(maxing){ if(val>best) best=val; if(best>alpha) alpha=best; }
+    else { if(val<best) best=val; if(best<beta) beta=best; }
+    if(alpha>=beta) break;
+  }
+  return (best===-1||best===99)? ddLeaf(hands,trump,decSide,turn) : best;
+}
+/* ---- constrained sampling of the hidden hands ---- */
+function brSeen(seat,ctrl){
+  const seen=new Set();
+  BR.seats[seat].hand.forEach(c=>seen.add(c));
+  for(let s=0;s<4;s++) BR.playedBy[s].forEach(c=>seen.add(c));
+  BR.trick.forEach(x=>seen.add(x.card));
+  return seen;
+}
+/* 沒有明手，所以每個人只知道自己那 13 張 —— 電腦跟真人看到的一樣多 */
+function brKnownSeat(s,seat,ctrl){ return s===seat; }
+function brHcpRange(s){
+  // rough range from that seat's calls
+  const calls=BR.auction.filter(c=>c.seat===s);
+  if(!calls.length) return [0,40];
+  const bids=calls.filter(c=>c.t==="B");
+  let lo=0, hi=40;
+  if(!bids.length){ hi=11; if(calls.some(c=>c.t==="X")) { lo=11; hi=40; } return [lo,hi]; }
+  const f=bids[0];
+  if(f.lvl===1&&f.str===4) return [15,17];
+  if(f.lvl===2&&f.str===4) return [20,21];
+  if(f.lvl===2&&f.str===0) return [21,40];
+  if(f.lvl>=2&&f.str<4&&(BR.auction.filter(c=>c.t==="B")[0]===f)) return [4,11];   // preempt
+  if(f.lvl===1) lo=11;
+  if(bids.length>=2) lo=Math.max(lo,6);
+  return [lo,hi];
+}
+function brSample(seat,ctrl){
+  const seen=brSeen(seat,ctrl);
+  const pool=[]; for(let c=0;c<52;c++) if(!seen.has(c)) pool.push(c);
+  const need=[0,0,0,0], hands=[[],[],[],[]];
+  for(let s=0;s<4;s++){
+    if(brKnownSeat(s,seat,ctrl)){ hands[s]=BR.seats[s].hand.slice(); continue; }
+    need[s]=BR.seats[s].hand.length;
+  }
+  if(need.reduce((a,b)=>a+b,0)!==pool.length) return null;
+  const order=[0,1,2,3].filter(s=>need[s]>0);
+  if(!order.length) return hands;
+  for(let attempt=0;attempt<36;attempt++){
+    const rem=pool.slice();
+    const bySeat={}; let ok=true;
+    for(const s of order){
+      bySeat[s]=[];
+      const legal=rem.filter(c=>!BR.seats[s].voids[cSuit(c)]);
+      if(legal.length<need[s]){ ok=false; break; }
+      for(let i=0;i<need[s];i++){
+        const j=Math.floor(Math.random()*legal.length);
+        const pick=legal[j]; legal.splice(j,1);
+        bySeat[s].push(pick); rem.splice(rem.indexOf(pick),1);
+      }
+    }
+    if(!ok) continue;
+    let bad=false;
+    for(const s of order){
+      const [lo,hi]=brHcpRange(s);
+      const p2=brHcp(bySeat[s].concat(BR.playedBy[s]));
+      if(p2<lo-3||p2>hi+3){ bad=true; break; }
+    }
+    if(bad&&attempt<28) continue;
+    order.forEach(s=>{ hands[s]=bySeat[s]; });
+    return hands;
+  }
+  return null;
+}
+/* ---- opening-lead conventions (trick 1) ---- */
+function brOpeningLead(seat){
+  const h=BR.seats[seat].hand, l=brShape(h);
+  const c=BR.contract, nt=(c.str===4), trump=nt?-1:ST2SU[c.str];
+  const pardSuit=(()=>{ const p=(seat+2)%4;
+    const b=BR.auction.filter(x=>x.seat===p&&x.t==="B"&&x.str<4); return b.length? ST2SU[b[b.length-1].str] : -1; })();
+  const decSuits=BR.auction.filter(x=>(x.seat%2)!==(seat%2)&&x.t==="B"&&x.str<4).map(x=>ST2SU[x.str]);
+  const seq=s=>{ const r=brSuitCards(h,s).map(cRank);
+    if(r.length>=3&&r[0]>=9&&r[0]-r[1]===1&&r[1]-r[2]===1) return 3;      // 3-card honour sequence
+    if(r.length>=3&&r[0]>=9&&r[0]-r[1]===1&&r[1]-r[2]===2) return 2;      // interior / broken
+    return 0; };
+  const pick=s=>{ const r=brSuitCards(h,s);
+    if(seq(s)) return r[0];
+    if(r.length>=4) return r[3];                                          // 4th best
+    if(r.length===3) return r[1];                                         // MUD
+    if(r.length===2) return r[0];                                         // top of doubleton
+    return r[0]; };
+  if(pardSuit>=0&&l[pardSuit]>0) return pick(pardSuit);
+  if(nt){
+    let best=-1,bq=-1;
+    for(let s=0;s<4;s++){ if(decSuits.includes(s)&&l[s]<5) continue;
+      const q=l[s]*2+brSuitCards(h,s).filter(x=>cRank(x)>=9).length+(seq(s)?4:0);
+      if(l[s]>=4&&q>bq){ bq=q; best=s; } }
+    if(best>=0) return pick(best);
+    for(let s=0;s<4;s++) if(seq(s)) return brSuitCards(h,s)[0];
+    return pick(brLongest(l,false));
+  }
+  // vs a suit contract
+  for(let s=0;s<4;s++) if(s!==trump&&seq(s)===3) return brSuitCards(h,s)[0];
+  for(let s=0;s<4;s++) if(s!==trump&&l[s]===1&&!decSuits.includes(s)) return brSuitCards(h,s)[0]; // singleton
+  for(let s=0;s<4;s++){ const r=brSuitCards(h,s).map(cRank);
+    if(s!==trump&&l[s]>=4&&r[0]<12&&!r.includes(12)) return brSuitCards(h,s)[3]; }              // 4th best, no A
+  for(let s=0;s<4;s++){ const r=brSuitCards(h,s).map(cRank);
+    if(s!==trump&&l[s]===2&&r[0]<11) return brSuitCards(h,s)[0]; }
+  if(trump>=0&&l[trump]>=3) return brSuitCards(h,trump)[brSuitCards(h,trump).length-1];         // trump lead
+  return pick(brLongest(l,false));
+}
+function brAIPlay(seat){
+  const legal=brLegalCards(seat);
+  if(!legal.length) return null;
+  if(legal.length===1) return legal[0];
+  if(BR.trickHist.length===0&&BR.trick.length===0&&seat===BR.leader){
+    const c=brOpeningLead(seat);
+    if(legal.includes(c)) return c;
+  }
+  const ctrl=brController(seat);
+  const decSide=brSide(BR.declarer);
+  const trump=brTrumpSuit();
+  const left=BR.seats[seat].hand.length;
+  const depth = left<=6 ? left : left<=8 ? 5 : left<=10 ? 4 : 3;
+  const cands=ddMoves(BR.seats[seat].hand, BR.trick.length? cSuit(BR.trick[0].card) : -1);
+  if(cands.length===1) return cands[0];
+  const score={}; cands.forEach(c=>score[c]=0);
+  let n=0; DD_T0=Date.now(); DD_MS=BR_THINK; DD_BUDGET=9000000; DD_NODES=0; DD_ABORT=false;
+  const SAMPLES=left<=6?14:12;
+  for(let k=0;k<SAMPLES;k++){
+    const hands=brSample(seat,ctrl);
+    if(!hands) break;
+    for(const c of cands){
+      const hh=hands.map(x=>x.slice());
+      const idx=hh[seat].indexOf(c);
+      if(idx<0) continue;
+      hh[seat].splice(idx,1);
+      const tr=BR.trick.map(x=>({seat:x.seat,card:x.card}));
+      tr.push({seat,card:c});
+      let v;
+      if(tr.length===4){
+        const w=brTrickWinner(tr,trump);
+        const gain=((w%2)===decSide)?1:0;
+        v=gain+ddRec(hh,trump,w,[],decSide,depth-1,-1,99);
+      } else {
+        v=ddRec(hh,trump,(seat+1)%4,tr,decSide,depth,-1,99);
+      }
+      score[c]+=v;
+    }
+    if(DD_ABORT) break;
+    n++;
+    if(Date.now()-DD_T0>BR_THINK) break;
+  }
+  if(!n) return legal[Math.floor(Math.random()*legal.length)];
+  const maxing=(seat%2)===decSide;
+  let best=cands[0], bv=maxing?-1e9:1e9;
+  for(const c of cands){
+    const v=score[c]/n;
+    if(maxing? v>bv : v<bv){ bv=v; best=c; }
+  }
+  return best;
+}
+/* ---------- state for clients ---------- */
+function brPublic(){
+  const c=BR.contract;
+  return {
+    roster: rosterOf(),
+    pace: G.pace,
+    stage:BR.stage, board:BR.board, dealer:BR.dealer, vuln:BR.vuln,
+    auction:BR.auction, contract:c, contractStr:c?brContractStr():"",
+    declarer:BR.declarer, dummy:BR.dummy, dummyShown:BR.dummyShown,
+    turn:BR.turn, leader:BR.leader, trick:BR.trick.map(x=>({seat:x.seat,card:cObj(x.card)})),
+    lastTrick: BR.lastTrick? {cards:BR.lastTrick.cards.map(x=>({seat:x.seat,card:cObj(x.card)})),win:BR.lastTrick.win}:null,
+    tricks:BR.tricks, played:BR.trickHist.length, handOver:BR.handOver, result:BR.result,
+    rub:BR.rub, phase:BR.phase, banner:BR.banner, log:BR.log,
+    seats:BR.seats.map((st,s)=>{
+      const p=brSeatP(s);
+      return { seat:s, label:BSEATS[s], name:p?p.name:BSEAT[s], isAI:p?p.isAI:true,
+        auto:st.auto, connected:p?(p.isAI?true:p.connected):true, avatar:p?p.avatar:null,
+        cards:st.hand.length, hand: BR.handOver? st.hand.map(cObj) : null,   // 打完才攤
+        side:brSide(s) };
+    })
+  };
+}
+function brPrivate(token){
+  const pi=G.players.findIndex(p=>p.token===token);
+  if(pi<0) return null;
+  const s=BR.seats.findIndex(st=>st.pi===pi);
+  if(s<0) return {seat:-1};
+  const me={ seat:s, label:BSEATS[s], hand:BR.seats[s].hand.map(cObj), auto:BR.seats[s].auto,
+             partner:(s+2)%4, isDeclarer:s===BR.declarer, isDummy:s===BR.dummy };
+  if(BR.handOver||BR.phase!=="play") { me.myTurn=false; return me; }
+  if(BR.stage==="auction"){
+    me.myTurn = BR.turn===s && !BR.seats[s].auto;
+    me.calls = me.myTurn? brLegalCalls(s) : null;
+    return me;
+  }
+  // 每個人只出自己的牌
+  me.myTurn = BR.turn===s && !BR.seats[s].auto;
+  me.playSeat = me.myTurn? s : -1;
+  me.playingDummy = false;
+  me.legal = me.myTurn? brLegalCards(s).map(cObj) : null;
+  me.dummyHand = null;
+  me.canClaim = false;
+  return me;
+}
+
 /* ================= STATE BROADCAST (SSE) ================= */
 let clients=[]; // {res, token|null(host)}
 const KA_MS=20000;      // SSE heartbeat
-const GRACE_MS=90000;   // stay "online" this long after a phone drops (app switch / screen lock)
+const GRACE_MS=300000;   // stay "online" this long after a phone drops (app switch / screen lock)
+function rosterOf(){
+  return G.players.filter(p=>!p.isAI&&!p.removed)
+    .map(p=>({id:p.id,name:p.name,connected:!!p.connected,avatar:p.avatar||null}));
+}
 function publicState(){
   return {
+    roster:rosterOf(),
     phase:G.phase, stage:G.stage, board:G.board, pot:potTotal(),
     dealer:G.dealer, sb:G.sb, bb:G.bb, turn:G.turn,
     banner:G.banner, log:G.log, handOver:G.handOver, revealAll:G.revealAll, stack:G.stack,
@@ -1119,7 +2059,7 @@ function publicState(){
     players:G.players.map((p,i)=>({
       id:p.id, name:p.name, isAI:p.isAI, chips:p.chips, bet:p.bet,
       folded:p.folded, allIn:p.allIn, inHand:p.inHand, won:p.won,
-      handsWon:p.handsWon, net:p.chips-p.start, connected:p.isAI?true:p.connected, removed:!!p.removed,
+      handsWon:p.handsWon, net:p.chips-p.start, connected:p.isAI?true:p.connected, removed:!!p.removed, auto:!!p.auto,
       avatar:p.avatar||null, wagered:p.wagered||0, handBet:p.handBet||0,
       showName:(G.stage===4)?p.showName:"",
       hole:( (G.stage===4&&p.inHand&&!p.folded) || (G.revealAll&&p.inHand&&!p.folded) ) ? p.hole : null
@@ -1146,7 +2086,16 @@ function privateFor(token){
 function sendTo(c){
   let payload;
   if(G.game==="mahjong") payload={ game:"mahjong", pub:mjPublicState(), me: c.token? mjPrivateFor(c.token):null };
+  else if(G.game==="bridge") payload={ game:"bridge", pub:brPublic(), me: c.token? brPrivate(c.token):null };
   else payload={ game:G.game, pub:publicState(), me: c.token? privateFor(c.token):null };
+  payload.code=TABLE_CODE;
+  payload.setup={
+    humans:G.players.filter(p=>!p.isAI&&!p.removed).length,
+    game:G.game,
+    running:(G.game==="poker"&&G.phase==="play")
+      ||(G.game==="mahjong"&&M.phase==="play")
+      ||(G.game==="bridge"&&BR.phase==="play")
+  };
   try{ c.res.write("data: "+JSON.stringify(payload)+"\n\n"); }catch(e){}
 }
 function broadcast(){ clients.forEach(sendTo); }
@@ -1194,7 +2143,10 @@ const server=http.createServer(async (req,res)=>{
     const c={res,token};
     clients.push(c);
     const p=G.players.find(x=>x.token===token);
-    if(p){ if(p.offTimer){ clearTimeout(p.offTimer); p.offTimer=null; } p.connected=true; }
+    if(p){ if(p.offTimer){ clearTimeout(p.offTimer); p.offTimer=null; } p.connected=true;
+      // 本人回來了 → 位子還他，已經做過的不回捲（CIO 2026-08-23）
+      if(p.auto){ p.auto=false; banner(p.name+" 回來了，位子還他｜"+p.name+" is back."); }
+    }
     sendTo(c); if(p) broadcast();
     // heartbeat: keeps proxies (Render/nginx) from killing an idle stream
     c.ka=setInterval(()=>{ try{ res.write(":ka\n\n"); }catch(e){} }, KA_MS);
@@ -1292,10 +2244,33 @@ const server=http.createServer(async (req,res)=>{
     const b=await body(req);
     const i=G.players.findIndex(x=>x.id===b.id);
     if(i<0) return json(res,{error:"Player not found."},400);
+    if(G.game==="bridge"&&BR.phase==="play"){
+      const s=BR.seats.findIndex(st=>st.pi===i);
+      if(s>=0&&!BR.handOver&&!brSeatP(s).isAI&&!BR.seats[s].auto){
+        BR.seats[s].auto=true; brBanner(brName(s)+" 改由電腦代打｜"+BSEATS[s]+" is now played by the computer.");
+        broadcast(); brResumeAuto(s);
+      }
+      return json(res,{ok:1});
+    }
     if(G.game==="mahjong"&&M.phase==="play"){
       const s=M.seats.findIndex(st=>st.pi===i);
       if(s>=0&&!M.handOver&&!seatP(s).isAI&&!M.seats[s].auto){
         M.seats[s].auto=true; mjBanner(seatName(s)+" 改由電腦代打。"); broadcast(); mjResumeAuto(s);
+        if(M.pending){ const c=M.pending.claims.find(x=>x.seat===s&&x.resp===null);
+          if(c){ c.resp=botClaim(s,c.opts,M.pending.tile)||{t:"pass"};
+            if(M.pending.claims.every(x=>x.resp!==null)){ M.claimSeq++; resolveClaims(); } else broadcast(); } }
+      }
+      return json(res,{ok:1});
+    }
+    // 撲克：牌局進行中絕對不能把人蓋牌踢掉 —— 那會把他的底牌、籌碼和這一手一起丟掉。
+    // 改成電腦代打，位子、底牌、籌碼、token 全部留著（CIO 2026-08-23）。
+    if(G.game==="poker"&&G.phase==="play"&&!G.handOver){
+      const p=G.players[i];
+      if(p&&!p.isAI&&!p.auto){
+        p.auto=true;
+        banner(p.name+" 改由電腦代打｜"+p.name+" is now played by the computer.");
+        broadcast();
+        if(G.turn===i) later(300,step);
       }
       return json(res,{ok:1});
     }
@@ -1305,6 +2280,16 @@ const server=http.createServer(async (req,res)=>{
 
   if(req.method==="POST"&&path==="/api/leave"){
     const b=await body(req);
+    if(G.game==="bridge"&&BR.phase==="play"&&!BR.handOver){
+      const pi0=G.players.findIndex(x=>x.token===b.token);
+      const s0=BR.seats.findIndex(st=>st.pi===pi0);
+      if(s0>=0){
+        if(!BR.seats[s0].auto){ BR.seats[s0].auto=true;
+          brBanner(brName(s0)+" 離開 — 電腦代打｜"+BSEATS[s0]+" left — computer takes over.");
+          broadcast(); brResumeAuto(s0); }
+        return json(res,{ok:1});
+      }
+    }
     if(G.game==="mahjong"&&M.phase==="play"&&!M.handOver){
       const pi=G.players.findIndex(x=>x.token===b.token);
       const s=M.seats.findIndex(st=>st.pi===pi);
@@ -1315,6 +2300,13 @@ const server=http.createServer(async (req,res)=>{
     }
     const i=G.players.findIndex(x=>x.token===b.token);
     if(i<0) return json(res,{ok:1}); // nothing to free — treat as success
+    if(G.game==="poker"&&G.phase==="play"&&!G.handOver&&!G.players[i].isAI){
+      G.players[i].auto=true;
+      banner(G.players[i].name+" 離開 — 電腦代打｜left the table, computer takes over.");
+      broadcast();
+      if(G.turn===i) later(300,step);
+      return json(res,{ok:1});
+    }
     removeSeat(i,"left the table");
     return json(res,{ok:1});
   }
@@ -1365,13 +2357,31 @@ const server=http.createServer(async (req,res)=>{
     return json(res,{ok:1});
   }
 
+  /* ---------- 大廳：排座位 ---------- */
+  if(req.method==="POST"&&path==="/api/seatorder"){
+    const b=await body(req);
+    const busy=(G.game==="poker"&&G.phase==="play")||(G.game==="mahjong"&&M.phase==="play"&&!M.handOver)
+      ||(G.game==="bridge"&&BR.phase==="play"&&!BR.handOver);
+    if(busy) return json(res,{error:"牌局進行中 — 這一局結束再排座位。"},400);
+    const humans=G.players.filter(p=>!p.isAI&&!p.removed);
+    const k=humans.findIndex(p=>p.id===b.id);
+    if(k<0) return json(res,{error:"找不到這位玩家。"},400);
+    const j=k+(b.dir==="up"?-1:1);
+    if(j<0||j>=humans.length) return json(res,{ok:1});
+    const ia=G.players.indexOf(humans[k]), ib=G.players.indexOf(humans[j]);
+    [G.players[ia],G.players[ib]]=[G.players[ib],G.players[ia]];
+    broadcast(); return json(res,{ok:1});
+  }
+
   /* ---------- portal ---------- */
   if(req.method==="POST"&&path==="/api/portal"){
     const b=await body(req);
-    const busy=(G.game==="poker"&&G.phase==="play")||(G.game==="mahjong"&&M.phase==="play"&&!M.handOver);
+    const busy=(G.game==="poker"&&G.phase==="play")||(G.game==="mahjong"&&M.phase==="play"&&!M.handOver)
+      ||(G.game==="bridge"&&BR.phase==="play"&&!BR.handOver);
     if(busy) return json(res,{error:"牌局進行中 — 先結束目前這局再換遊戲。"},400);
-    G.game=(b.game==="poker"||b.game==="mahjong")?b.game:null;
+    G.game=(b.game==="poker"||b.game==="mahjong"||b.game==="bridge")?b.game:null;
     if(G.game!=="mahjong"&&M.phase==="play"){ M.phase="idle"; M.seq++; M.claimSeq++; }
+    if(G.game!=="bridge"&&BR.phase==="play"){ BR.phase="idle"; BR.seq++; }
     broadcast(); return json(res,{ok:1});
   }
 
@@ -1436,6 +2446,21 @@ const server=http.createServer(async (req,res)=>{
     return json(res,{ok:1});
   }
 
+  if(req.method==="POST"&&path==="/api/mj/groups"){
+    const b=await body(req);
+    const pi=G.players.findIndex(p=>p.token===b.token);
+    const s=M.seats.findIndex(st=>st.pi===pi);
+    if(pi<0||s<0) return json(res,{error:"\u4f60\u6c92\u6709\u5165\u5ea7\u3002"},400);
+    const st=M.seats[s];
+    const hand=st.hand.concat(st.drawn!==null&&st.drawn!==undefined?[st.drawn]:[]);
+    if(!hand.length) return json(res,{ok:1,groups:[]});
+    let groups=[];
+    try{ groups=mjGroupPlan(hand); }catch(e){ return json(res,{error:"\u7406\u4e0d\u52d5\uff0c\u81ea\u5df1\u6392\u5427"},400); }
+    const need=16-3*st.melds.length;
+    const sh=mjShanten(countsOf(st.hand),Math.floor(need/3));
+    return json(res,{ok:1,groups,shanten:sh});
+  }
+
   if(req.method==="POST"&&path==="/api/mj/next"){
     if(G.game!=="mahjong"||M.phase!=="play"||!M.handOver) return json(res,{error:"這局還沒結束。"},400);
     mjNewHand(); return json(res,{ok:1});
@@ -1457,6 +2482,80 @@ const server=http.createServer(async (req,res)=>{
     const b=await body(req);
     M.phase="idle"; M.seq++; M.claimSeq++; M.seats=[]; M.handOver=false; M.winInfo=null;
     M.banner=""; M.log=[]; M.handCount=0;
+    G.players=G.players.filter(p=>!p.isAI);
+    if(b.portal) G.game=null;
+    broadcast(); return json(res,{ok:1});
+  }
+
+
+  /* ---------- bridge 橋牌 ---------- */
+  if(req.method==="POST"&&path==="/api/br/start"){
+    if(G.game!=="bridge") return json(res,{error:"請先在大廳選擇橋牌。"},400);
+    if(BR.phase==="play"&&!BR.handOver) return json(res,{error:"已經開局。"},400);
+    G.players=G.players.filter(p=>!p.isAI);
+    const humans=G.players.filter(p=>!p.removed);
+    if(humans.length<1) return json(res,{error:"至少要有一位玩家掃碼入座。"},400);
+    const seated=humans.slice(0,4);
+    for(let k=seated.length;k<4;k++){
+      G.players.push({id:"brai"+k,token:null,isAI:true,name:BR_BOT_NAMES[k],chips:0,start:0,handsWon:0,
+        hole:[],folded:false,allIn:false,bet:0,total:0,need:false,inHand:false,won:false,showName:"",
+        connected:true,avatar:null,wagered:0,brScore:0});
+      seated.push(G.players[G.players.length-1]);
+    }
+    G.players.forEach(p=>{ p.brScore=0; });
+    BR.seats=seated.map(p=>({pi:G.players.indexOf(p),hand:[],auto:false,voids:[false,false,false,false]}));
+    BR.rub={games:[0,0],below:[0,0],above:[0,0],total:[0,0],rubbers:[0,0],hist:[]};
+    BR.board=0; BR.dealer=3; BR.log=[]; BR.banner="";
+    brNewDeal();
+    return json(res,{ok:1});
+  }
+  if(req.method==="POST"&&path==="/api/br/call"){
+    const b=await body(req);
+    const pi=G.players.findIndex(p=>p.token===b.token);
+    const s=BR.seats.findIndex(st=>st.pi===pi);
+    if(pi<0||s<0) return json(res,{error:"你沒有入座。"},400);
+    if(G.game!=="bridge"||BR.stage!=="auction"||BR.handOver) return json(res,{error:"現在不是叫牌階段。"},400);
+    if(BR.turn!==s||BR.seats[s].auto) return json(res,{error:"還沒輪到你。"},400);
+    const c=b.call||{};
+    if(!["P","X","XX","B"].includes(c.t)) return json(res,{error:"Bad call."},400);
+    const call={t:c.t,lvl:c.lvl|0,str:c.str|0};
+    if(!brCall(s,call)) return json(res,{error:"這個叫品不合法｜That call is not legal."},400);
+    return json(res,{ok:1});
+  }
+  if(req.method==="POST"&&path==="/api/br/play"){
+    const b=await body(req);
+    const pi=G.players.findIndex(p=>p.token===b.token);
+    const s=BR.seats.findIndex(st=>st.pi===pi);
+    if(pi<0||s<0) return json(res,{error:"你沒有入座。"},400);
+    if(G.game!=="bridge"||BR.stage!=="play"||BR.handOver) return json(res,{error:"現在不是打牌階段。"},400);
+    if(brController(BR.turn)!==s||BR.seats[s].auto) return json(res,{error:"還沒輪到你。"},400);
+    if(!brPlay(BR.turn,b.card|0)) return json(res,{error:"這張牌不能出（必須跟花色）｜Illegal card — you must follow suit."},400);
+    return json(res,{ok:1});
+  }
+  if(req.method==="POST"&&path==="/api/br/next"){
+    if(G.game!=="bridge"||BR.phase!=="play"||!BR.handOver) return json(res,{error:"這副還沒結束。"},400);
+    brNewDeal(); return json(res,{ok:1});
+  }
+  if(req.method==="POST"&&path==="/api/br/auto"){
+    const b=await body(req);
+    const s=b.seat|0;
+    if(!(s>=0&&s<4)||!BR.seats[s]) return json(res,{error:"Bad seat."},400);
+    if(brSeatP(s).isAI) return json(res,{error:"這是電腦玩家。"},400);
+    BR.seats[s].auto=!BR.seats[s].auto;
+    brBanner(brName(s)+(BR.seats[s].auto?" 改由電腦代打｜computer takes over":" 恢復自己打｜back in the driver's seat"));
+    broadcast();
+    if(BR.seats[s].auto) brResumeAuto(s);
+    return json(res,{ok:1});
+  }
+  if(req.method==="POST"&&path==="/api/br/endrubber"){
+    if(G.game!=="bridge"||!BR.seats.length) return json(res,{error:"還沒開局。"},400);
+    brEndRubber(); return json(res,{ok:1});
+  }
+  if(req.method==="POST"&&path==="/api/br/reset"){
+    const b=await body(req);
+    BR.phase="idle"; BR.seq++; BR.seats=[]; BR.handOver=false; BR.result=null;
+    BR.banner=""; BR.log=[]; BR.board=0; BR.auction=[]; BR.contract=null; BR.trick=[]; BR.trickHist=[];
+    BR.rub={games:[0,0],below:[0,0],above:[0,0],total:[0,0],rubbers:[0,0],hist:[]};
     G.players=G.players.filter(p=>!p.isAI);
     if(b.portal) G.game=null;
     broadcast(); return json(res,{ok:1});
@@ -1502,6 +2601,22 @@ const PORTAL_CSS=`
 .qrBox .url{font-size:1rem;font-weight:700;word-break:break-all;}
 .pl{list-style:none;} .pl li{padding:10px 4px;border-bottom:1px solid var(--line);font-size:1rem;display:flex;gap:8px;align-items:center;}
 .av{width:26px;height:26px;border-radius:50%;background:#e4ddc9 center/cover no-repeat;display:inline-block;border:1px solid var(--line);flex:none;}
+.codeChip{display:inline-block;vertical-align:middle;margin-left:10px;font-family:ui-monospace,Menlo,Consolas,monospace;letter-spacing:.22em;font-size:1rem;background:var(--ink);color:var(--gold);border-radius:8px;padding:4px 12px 4px 14px;}
+.steps{list-style:none;display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 8px;padding:0;}
+.steps li{display:flex;align-items:center;gap:7px;font-size:.82rem;color:var(--mut);background:#fff;border:1px solid var(--line);border-radius:999px;padding:5px 13px 5px 6px;}
+.steps li b{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;background:#eee7d8;color:var(--mut);font-size:.72rem;}
+.steps li.on{color:var(--ink);border-color:var(--felt);box-shadow:inset 0 0 0 1px var(--felt);font-weight:700;}
+.steps li.on b{background:var(--felt);color:#fff;}
+.steps li.done{color:var(--ok);} .steps li.done b{background:var(--ok);color:#fff;}
+.nowBar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-left:4px solid var(--gold);border-radius:0 11px 11px 0;padding:10px 13px;font-size:.9rem;margin-bottom:6px;}
+.nowDot{width:8px;height:8px;border-radius:50%;background:var(--gold);flex:none;}
+.goBtn{margin-left:auto;border:0;border-radius:9px;background:var(--felt);color:#fff;font-weight:700;font-size:.92rem;padding:10px 20px;cursor:pointer;}
+.seatMove{display:inline-flex;gap:2px;margin-left:4px;}
+.seatMove button{border:1px solid var(--line);background:#fff;border-radius:5px;font-size:.62rem;line-height:1;padding:3px 5px;cursor:pointer;color:var(--mut);}
+.seatMove button:disabled{opacity:.25;cursor:not-allowed;}
+.pl li .seatNo{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:var(--felt);color:#fff;font-size:.72rem;font-weight:700;flex:none;}
+.pl li .seatTag{font-size:.66rem;letter-spacing:.06em;background:#eee7d8;color:var(--mut);border-radius:5px;padding:1px 6px;}
+.pl li .kick{margin-left:auto;}
 .gameCards{display:flex;gap:18px;flex-wrap:wrap;margin:16px 0;}
 .gameCard{flex:1;min-width:200px;background:#fff;border:2px solid var(--line);border-radius:16px;padding:26px 20px;text-align:center;cursor:pointer;transition:.15s;}
 .gameCard:hover{border-color:var(--gold);transform:translateY(-2px);}
@@ -1512,8 +2627,15 @@ const PORTAL_CSS=`
 .gameCard .live{display:inline-block;margin-top:7px;font-size:.68rem;letter-spacing:.1em;background:var(--felt);color:#fff;border-radius:6px;padding:2px 8px;}
 `;
 const PORTAL_BODY=`
-  <h1 class="disp">盧家遊樂園 · Lu Family Game Portal</h1>
+  <h1 class="disp">盧家遊樂園 · Lu Family Game Portal <span class="codeChip" id="tableCode">—</span></h1>
   <div class="sub" id="portalSub"></div>
+  <ol class="steps" id="setupSteps">
+    <li data-k="1"><b>1</b> 掃碼入座</li>
+    <li data-k="2"><b>2</b> 排座位</li>
+    <li data-k="3"><b>3</b> 選遊戲</li>
+    <li data-k="4"><b>4</b> 開始</li>
+  </ol>
+  <div class="nowBar"><span class="nowDot"></span><span id="setupHint"></span><button class="goBtn hidden" id="setupGo"></button></div>
   <div class="lobbyGrid">
     <div class="qrBox">
       <div style="font-size:.8rem;color:var(--mut)">Scan to join · 掃碼入座</div>
@@ -1521,8 +2643,9 @@ const PORTAL_BODY=`
       <div class="url" id="joinUrl2"></div>
     </div>
     <div>
-      <h3 class="disp">已入座 Players</h3>
+      <h3 class="disp">已入座 Players <span style="font-size:.72rem;color:var(--mut);font-weight:400">— 座位順序就是入座順序（麻將、橋牌照這個排）</span></h3>
       <ul class="pl" id="portalList"></ul>
+      <div class="sub" id="portalSeatHint" style="margin:2px 0 0"></div>
       <div class="gameCards">
         <div class="gameCard" id="gcPoker" onclick="api('/api/portal',{game:'poker'})">
           <div class="big">🃏</div><h2>德州撲克</h2>
@@ -1534,6 +2657,11 @@ const PORTAL_BODY=`
           <div class="gcsub">十六張 · 4人 · 電腦補位 · 底＋台計分</div>
           <div class="live hidden" id="gcMahjongLive">進行中 LIVE</div>
         </div>
+        <div class="gameCard" id="gcBridge" onclick="api('/api/portal',{game:'bridge'})">
+          <div class="big">\u2660\u2665</div><h2>橋牌 Bridge</h2>
+          <div class="gcsub">Contract Bridge · 4人 · 電腦高手補位 · 局盤 Rubber 計分</div>
+          <div class="live hidden" id="gcBridgeLive">進行中 LIVE</div>
+        </div>
         <div class="gameCard" id="gcBig2" onclick="location.href='/dalaoer'">
           <div class="big">🀫</div><h2>大老二</h2>
           <div class="gcsub">Big Two · 4人 · 電腦補位 · 盧家玩法</div>
@@ -1543,6 +2671,40 @@ const PORTAL_BODY=`
   </div>
 `;
 const PORTAL_JS=`
+function seatMove(id,dir){ api("/api/seatorder",{id:id,dir:dir}); }
+var GAME_LABEL={poker:"\u5fb7\u5dde\u64b2\u514b",mahjong:"\u53f0\u7063\u9ebb\u5c07",bridge:"\u6a4b\u724c Bridge"};
+function renderSetup(list,host){
+  var codeEl=document.getElementById("tableCode");
+  if(codeEl) codeEl.textContent=(window.__code||"\u2014");
+  var su=(window.__setup)||{humans:list.length,game:null,running:false};
+  var n=list.length, g=su.game, running=!!su.running;
+  var step = running?4 : (!n?1 : (!g?3 : 4));
+  var lis=document.querySelectorAll("#setupSteps li");
+  for(var i=0;i<lis.length;i++){
+    var k=i+1;
+    lis[i].className = k<step?"done" : (k===step?"on":"");
+  }
+  var hintEl=document.getElementById("setupHint"), goEl=document.getElementById("setupGo");
+  if(!hintEl||!goEl) return;
+  var need4=(g==="mahjong"||g==="bridge");
+  var txt="", go=null, label="";
+  if(running){ txt="\u724c\u5c40\u9032\u884c\u4e2d \u2014 "+(GAME_LABEL[g]||"")+"\uff0c\u5207\u5230\u300c3 \u00b7 \u724c\u684c\u300d\u770b\u724c";
+    label="\u56de\u724c\u684c \u2192"; go=function(){ setView(3); }; }
+  else if(!n){ txt="\u7b49\u5bb6\u4eba\u7528\u624b\u6a5f\u6383\u4e0a\u9762\u7684 QR \u2014 \u6383\u5b8c\u540d\u5b57\u6703\u51fa\u73fe\u5728\u9019\u4e00\u5217"; }
+  else if(!g){ txt=n+" \u4eba\u5165\u5ea7\u3002\u7528 \u25b2\u25bc \u6392\u597d\u5ea7\u4f4d\uff0c\u7136\u5f8c\u9ede\u4e0b\u9762\u7684\u904a\u6232\u5361"; }
+  else {
+    var fill = need4 ? Math.max(0,4-n) : 0;
+    txt=(GAME_LABEL[g]||"")+" \u5df2\u9078\u3002"+n+" \u4eba\u5165\u5ea7"
+      +(fill?"\uff0c\u7f3a\u7684 "+fill+" \u5bb6\u7531\u96fb\u8166\u88dc\u4f4d":"")+"\u3002";
+    if(g==="bridge"){ label="\u958b\u59cb\u6a4b\u724c"; go=function(){ api("/api/br/start"); }; }
+    else if(g==="mahjong"){ label="\u958b\u59cb\u9ebb\u5c07"; go=function(){ api("/api/mj/start",{base:30,tai:10}); }; }
+    else { label="\u53bb\u8a2d\u5b9a\u7c4c\u78bc \u2192"; go=function(){ setView(2); }; }
+    if(g!=="poker") txt+="\u8981\u6539\u5e95\u53f0\u3001\u7c4c\u78bc\u9019\u4e9b\u8a2d\u5b9a\uff0c\u5207\u5230\u300c2 \u00b7 \u8a2d\u5b9a\u300d\u3002";
+  }
+  hintEl.textContent=txt;
+  if(host&&go){ goEl.classList.remove("hidden"); goEl.textContent=label; goEl.onclick=go; }
+  else goEl.classList.add("hidden");
+}
 const joinUrl2=location.origin+"/join";
 document.getElementById("joinUrl2").textContent=joinUrl2;
 try{ new QRCode(document.getElementById("qr2"),{text:joinUrl2,width:190,height:190}); }
@@ -1550,27 +2712,107 @@ catch(e){ document.getElementById("qr2").innerHTML='<div style="font-size:.8rem;
 function pEsc(t){ return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function renderPortal(){
   const list=(S&&S.roster&&S.roster.length)? S.roster : ((S&&S.players)||[]).filter(function(p){return !p.isAI;});
+  const SEATN=["N \u5317","E \u6771","S \u5357","W \u897F"];
+  const host=(typeof IS_HOST!=="undefined")&&IS_HOST;
   document.getElementById("portalList").innerHTML= list.length
-    ? list.map(function(p){ return '<li>'+(p.avatar?'<span class="av" style="background-image:url('+p.avatar+')"></span>':'\u{1F4F1}')
-        +' '+pEsc(p.name)+(p.connected===false?' <span class="badge off">offline</span>':'')+'</li>'; }).join("")
+    ? list.map(function(p,i){
+        return '<li>'
+          +'<span class="seatNo">'+(i+1)+'</span>'
+          +(p.avatar?'<span class="av" style="background-image:url('+p.avatar+')"></span>':'\u{1F4F1}')
+          +' '+pEsc(p.name)
+          +(i<4?' <span class="seatTag">'+SEATN[i]+'</span>':'')
+          +(p.connected===false?' <span class="badge off">offline</span>':'')
+          +(host?' <span class="seatMove">'
+              +'<button onclick="seatMove(&#39;'+p.id+'&#39;,&#39;up&#39;)" '+(i===0?'disabled':'')+'>\u25b2</button>'
+              +'<button onclick="seatMove(&#39;'+p.id+'&#39;,&#39;down&#39;)" '+(i===list.length-1?'disabled':'')+'>\u25bc</button>'
+            +'</span>':'')
+          +(host?' <button class="kick" onclick="portalKick(&#39;'+p.id+'&#39;)">\u79fb\u9664 remove</button>':'')
+          +'</li>'; }).join("")
     : '<li style="color:var(--mut)">Waiting for phones\u2026</li>';
+  renderSetup(list, host);
+  var hint=document.getElementById("portalSeatHint");
+  if(hint) hint.textContent = list.length
+    ? (host? "\u5165\u5ea7\u3001\u6392\u5e8f\u3001\u8acb\u4eba\u4e0b\u684c \u2014 \u5168\u90e8\u5728\u9019\u4e00\u5c64\u505a\uff0c\u4e0d\u7528\u9032\u904a\u6232"
+             : "\u8981\u79fb\u9664\u4eba\uff0c\u8acb\u5728\u5927\u87a2\u5e55\u7684\u5927\u5ef3\u64cd\u4f5c")
+    : "";
   const g=(typeof GAME==="undefined")?null:GAME;
   document.getElementById("gcPoker").classList.toggle("on",g==="poker");
   document.getElementById("gcMahjong").classList.toggle("on",g==="mahjong");
   document.getElementById("gcPokerLive").classList.toggle("hidden",g!=="poker");
   document.getElementById("gcMahjongLive").classList.toggle("hidden",g!=="mahjong");
+  document.getElementById("gcBridge").classList.toggle("on",g==="bridge");
+  document.getElementById("gcBridgeLive").classList.toggle("hidden",g!=="bridge");
   document.getElementById("portalSub").textContent =
     g==="poker" ? "德州撲克進行中 — 切到 3 · 牌桌繼續"
     : g==="mahjong" ? "台灣麻將進行中 — 切到 3 · 牌桌繼續"
+    : g==="bridge" ? "橋牌進行中 — 切到 3 · 牌桌繼續"
     : "手機掃碼入座 — 全家同一個入口，在這裡選遊戲";
 }
+`;
+
+
+/* ===== BRIDGE 橋牌 ===== */
+const BRIDGE_CSS=`
+.brTable{display:grid;grid-template-columns:1fr 1.35fr 1fr;grid-template-rows:auto minmax(140px,1fr) auto;gap:8px;
+background:radial-gradient(ellipse at 50% 50%,var(--felt) 0%,var(--felt-deep) 100%);border:8px solid var(--rail);
+border-radius:20px;padding:12px;box-shadow:inset 0 0 55px rgba(0,0,0,.32);}
+.brSeat{background:#fff;border:1px solid var(--line);border-radius:12px;padding:7px 9px;box-shadow:0 2px 8px rgba(0,0,0,.22);align-self:center;min-width:0;}
+.brSeat.turn{border-color:var(--gold);box-shadow:0 0 0 3px var(--gold),0 2px 8px rgba(0,0,0,.22);}
+.brSeat.top{grid-column:2;grid-row:1;} .brSeat.bottom{grid-column:2;grid-row:3;}
+.brSeat.left{grid-column:1;grid-row:2;} .brSeat.right{grid-column:3;grid-row:2;}
+.brSeat .hd{display:flex;gap:6px;align-items:center;font-size:.85rem;font-weight:700;flex-wrap:wrap;}
+.brSeat .hd .rt{margin-left:auto;font-size:.72rem;color:var(--mut);font-weight:600;}
+.brSeat .dh{display:flex;gap:2px;flex-wrap:wrap;margin-top:5px;}
+.brSeat .dh .brSuitRow{flex-basis:100%;}
+.brCenter{grid-column:2;grid-row:2;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#eef2ec;text-align:center;gap:4px;}
+.brTrick{display:grid;grid-template-columns:repeat(3,auto);grid-template-rows:repeat(3,auto);gap:3px;justify-items:center;align-items:center;min-height:120px;}
+.brTrick .tN{grid-column:2;grid-row:1;} .brTrick .tS{grid-column:2;grid-row:3;}
+.brTrick .tW{grid-column:1;grid-row:2;} .brTrick .tE{grid-column:3;grid-row:2;}
+.brTrick .tM{grid-column:2;grid-row:2;font-size:.7rem;color:#bfd6c6;}
+.brTrick .meSlot{outline:2px dashed var(--felt);outline-offset:3px;border-radius:8px;}
+.badge.dec{background:#8a5a18;} .badge.dum{background:#4a6b8a;} .badge.vul{background:#b02c22;}
+.badge.seat{background:var(--felt);}
+table.auc{border-collapse:collapse;font-size:.86rem;background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden;}
+table.auc th{background:#6c757d;color:#fff;padding:5px 12px;font-weight:600;}
+table.auc th.dl{background:var(--gold);color:#3d2f10;}
+table.auc td{padding:4px 12px;border-bottom:1px solid var(--line);text-align:center;min-width:52px;}
+table.auc td.cur{background:#fff8ea;font-weight:700;}
+.redS{color:var(--red-suit);}
+table.rub{border-collapse:collapse;font-size:.85rem;background:#fff;border:1px solid var(--line);width:100%;}
+table.rub th{background:#6c757d;color:#fff;padding:6px 9px;text-align:left;font-weight:600;}
+table.rub td{padding:5px 9px;border-bottom:1px solid var(--line);}
+table.rub tr.ln td{border-bottom:3px solid var(--ink);}
+.brBox{background:#fff;border:1px solid var(--line);border-radius:13px;padding:11px 14px;}
+.brGrid{display:grid;grid-template-columns:1fr 300px;gap:12px;align-items:start;margin-top:10px;}
+@media(max-width:820px){.brGrid{grid-template-columns:1fr;}}
+.bidGrid{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;}
+.bidGrid button{padding:11px 2px;border:1px solid var(--line);background:#fff;border-radius:8px;font-size:.9rem;font-weight:700;cursor:pointer;color:var(--ink);}
+.bidGrid button.off{opacity:.25;cursor:not-allowed;}
+.bidRow{display:flex;gap:7px;margin-top:8px;}
+.bidRow button{flex:1;padding:13px 4px;border:0;border-radius:11px;font-size:.95rem;font-weight:700;cursor:pointer;}
+.bidRow .bPass{background:#eee7d8;color:var(--ink);} .bidRow .bDbl{background:var(--warn);color:#fff;}
+.bidRow .bRdbl{background:#b02c22;color:#fff;} .bidRow button:disabled{opacity:.3;}
+.brHand{display:flex;gap:3px;flex-wrap:wrap;padding:6px 0;}
+.brHand .card{cursor:default;transition:.12s;}
+.brHand.live .card.ok{cursor:pointer;box-shadow:0 0 0 2px var(--ok),0 1px 3px rgba(0,0,0,.35);}
+.brHand.live .card.ok:hover{transform:translateY(-7px);}
+.brHand .card.no{opacity:.4;}
+.brSuitRow{display:flex;gap:3px;align-items:center;margin-bottom:3px;flex-wrap:wrap;}
+.brSuitRow .sl{width:18px;font-size:1rem;font-weight:700;flex:none;}
+.brTurnLn{font-weight:700;color:var(--gold);min-height:1.3em;}
+.brNote{font-size:.78rem;color:var(--mut);}
+.brResult{background:#fff8ea;border:2px solid var(--gold);border-radius:12px;padding:12px 14px;margin-top:10px;}
+.brResult h4{font-size:1.05rem;margin-bottom:6px;}
+.brResult table{width:100%;border-collapse:collapse;font-size:.85rem;}
+.brResult td{padding:3px 6px;border-bottom:1px solid var(--line);}
+.brResult td.n{text-align:right;font-weight:700;}
 `;
 
 /* ================= HOST (TV) PAGE ================= */
 const HOST_HTML=`<!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>盧家遊樂園 · Lu Family Portal</title>
-<style>${CSS}${PORTAL_CSS}
-.qrBox #qr,.qrBox #qr3{display:flex;justify-content:center;margin:8px 0;}
+<style>${CSS}${PORTAL_CSS}${BRIDGE_CSS}
+.qrBox #qr,.qrBox #qr3,.qrBox #qr4{display:flex;justify-content:center;margin:8px 0;}
 .wrap{max-width:1100px;margin:0 auto;padding:18px 16px;}
 .card{width:55px;height:79px;font-size:1.3rem;border-radius:7px;}
 .card .s{font-size:1.2rem;}
@@ -1661,6 +2903,9 @@ border-radius:13px;padding:8px 9px;box-shadow:0 3px 10px rgba(0,0,0,.18);}
 .mjSeat .hd{display:flex;gap:6px;align-items:center;font-size:.85rem;font-weight:700;flex-wrap:wrap;}
 .mjSeat .hd .sc{margin-left:auto;} .mjSeat .lb{font-size:.56rem;color:var(--mut);letter-spacing:.12em;margin:5px 0 2px;}
 .mjSeat .tstrip{display:flex;gap:2px;flex-wrap:wrap;}
+.backStrip{display:inline-flex;align-items:center;gap:2px;}
+.backBar{display:inline-block;width:9px;height:26px;border-radius:2px;flex:none;background:repeating-linear-gradient(45deg,#3f6e58 0 4px,#35604c 4px 8px);border:1px solid #2c5240;}
+.backNum{margin-left:6px;font-size:.68rem;color:var(--mut);font-weight:700;}
 .mjCenter{grid-column:2;grid-row:2;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#eef2ec;text-align:center;gap:3px;}
 /* ---- layer toggle ---- */
 .layerBar{display:flex;gap:9px;align-items:center;margin:0 0 12px;flex-wrap:wrap;}
@@ -1695,7 +2940,7 @@ border-radius:13px;padding:8px 9px;box-shadow:0 3px 10px rgba(0,0,0,.18);}
       <div class="url" id="joinUrl"></div>
     </div>
     <div>
-      <h3 class="disp">Players joined</h3>
+      <h3 class="disp">Players joined <span style="font-size:.72rem;color:var(--mut);font-weight:400">— 入座與移除都在 1 · 大廳</span></h3>
       <ul class="pl" id="lobbyList"><li style="color:var(--mut)">Waiting for phones…</li></ul>
       <div class="opts">
         <div class="pill" id="pillMode">
@@ -1785,6 +3030,51 @@ border-radius:13px;padding:8px 9px;box-shadow:0 3px 10px rgba(0,0,0,.18);}
   <div id="mjWinBox" class="hidden" style="background:#fff;border:1px solid var(--line);border-radius:13px;padding:14px 16px;margin-top:4px;"></div>
 </div>
 
+
+<div id="brLobby" class="hidden">
+  <h1 class="disp">橋牌 Bridge · 合約橋牌 <button class="tbtn" style="vertical-align:middle" onclick="api('/api/portal',{game:null})">← 回大廳</button></h1>
+  <div class="sub">叫牌／加倍／13 墩／局盤 Rubber 計分全照橋牌規則。<b>盧家桌規：每個人打自己的牌，不攤明手</b> —— 四家的牌全程不公開，人不在才由電腦代打。前 4 位入座，不足由電腦高手補位。</div>
+  <div class="lobbyGrid">
+    <div class="qrBox">
+      <div style="font-size:.8rem;color:var(--mut)">Scan to join · 掃碼入座</div>
+      <div id="qr4"></div>
+    </div>
+    <div>
+      <h3 class="disp">入座名單 · 座位依加入順序 N → E → S → W</h3>
+      <ul class="pl" id="brList"><li style="color:var(--mut)">Waiting for phones…</li></ul>
+      <button class="startBtn" onclick="api('/api/br/start')">開局 Deal</button>
+      <div class="sub" style="margin-top:10px">N/S 一組、E/W 一組。電腦叫牌用 SAYC（五張高花、15-17 無王、Stayman、轉移叫、Blackwood），打牌用蒙地卡羅雙明手搜尋。</div>
+    </div>
+  </div>
+</div>
+
+<div id="brGame" class="hidden">
+  <div class="bar">
+    <span class="tag" id="brTag"></span>
+    <button class="tbtn on" id="brPace" onclick="api('/api/pace')">節奏：慢</button>
+    <button class="tbtn" onclick="if(confirm('結算目前這個局盤？未完成局盤依規則加 300／100，然後開始新的局盤。'))api('/api/br/endrubber')">結算局盤 End rubber</button>
+    <button class="tbtn" onclick="if(confirm('結束整場回設定？分數會清空。'))api('/api/br/reset')">結束牌局</button>
+    <button class="tbtn" onclick="if(confirm('回到遊戲大廳？'))api('/api/br/reset',{portal:true})">回大廳</button>
+  </div>
+  <div class="mjTop">
+    <div class="bn" id="brBanner"></div>
+    <div class="lg" id="brLog"></div>
+    <button class="nextBtn hidden" id="brNextBtn" onclick="api('/api/br/next')">下一副 Next deal →</button>
+  </div>
+  <div class="brTable" id="brTableBox"></div>
+  <div class="brGrid">
+    <div class="brBox">
+      <div style="font-size:.7rem;letter-spacing:.14em;color:var(--mut);margin-bottom:6px">叫牌紀錄 AUCTION</div>
+      <div id="brAuction"></div>
+      <div id="brResultBox"></div>
+    </div>
+    <div class="brBox">
+      <div style="font-size:.7rem;letter-spacing:.14em;color:var(--mut);margin-bottom:6px">局盤計分表 RUBBER SCORE</div>
+      <div id="brScore"></div>
+    </div>
+  </div>
+</div>
+
 <div class="panel hidden" id="statsPanel" onclick="if(event.target===this)closeStats()">
   <div class="panelIn">
     <h3 class="disp">Session standings</h3>
@@ -1798,6 +3088,13 @@ border-radius:13px;padding:8px 9px;box-shadow:0 3px 10px rgba(0,0,0,.18);}
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
+const IS_HOST=true;   // 這是大螢幕（大廳），只有這裡可以請人下桌
+function portalKick(id){
+  const p=((S&&S.roster)||[]).filter(function(x){return x.id===id;})[0];
+  const nm=p? p.name : "這位玩家";
+  if(!confirm("把 "+nm+" 從牌桌移除？")) return;
+  api("/api/kick",{id:id});
+}
 const SUITS=["♠","♥","♦","♣"],RN={11:"J",12:"Q",13:"K",14:"A"};
 const rN=r=>RN[r]||String(r);
 const cardHTML=(c,cls="")=>{const red=(c.s===1||c.s===2);
@@ -1806,6 +3103,7 @@ const joinUrl=location.origin+"/join";
 document.getElementById("joinUrl").textContent=joinUrl;
 try{ new QRCode(document.getElementById("qr"),{text:joinUrl,width:190,height:190}); }
 catch(e){ document.getElementById("qr").innerHTML='<div style="font-size:.8rem;color:#a3542e">No internet for QR lib — type the URL below into each phone.</div>'; }
+try{ new QRCode(document.getElementById("qr4"),{text:joinUrl,width:190,height:190}); }catch(e){}
 document.querySelectorAll(".pill").forEach(p=>p.addEventListener("click",e=>{
  const b=e.target.closest("button"); if(!b)return;
  p.querySelectorAll("button").forEach(x=>x.classList.remove("on")); b.classList.add("on");}));
@@ -1821,7 +3119,8 @@ function openES(){
   es=new EventSource("/events");
   es.onerror=function(){ if(esRetry) return;
     esRetry=setTimeout(function(){ esRetry=null; openES(); },2000); };
-  es.onmessage=e=>{ const d=JSON.parse(e.data); GAME=d.game; S=d.pub; render(); };
+  es.onmessage=e=>{ const d=JSON.parse(e.data); GAME=d.game; S=d.pub;
+    window.__roster=(d.pub&&d.pub.roster)||[]; window.__code=d.code; window.__setup=d.setup; render(); };
 }
 openES();
 setInterval(function(){ if(!es||es.readyState===2) openES(); },5000);
@@ -1829,33 +3128,38 @@ document.addEventListener("visibilitychange",function(){ if(!document.hidden&&(!
 function setView(n){ VIEW=n; render(); }
 function autoLayer(){
   if(GAME===null||GAME===undefined) return 1;
-  if(GAME==="mahjong") return (S&&S.phase==="play")?3:2;
-  return (S&&S.phase==="lobby")?2:3;
+  if(GAME==="mahjong") return (S&&S.phase==="play")?3:1;   // 選了還沒開 → 留在大廳
+  if(GAME==="bridge")  return (S&&S.phase==="play")?3:1;
+  return (S&&S.phase==="lobby")?1:3;
 }
 function render(){
-  const noGame=(GAME===null||GAME===undefined), mjOn=(GAME==="mahjong");
+  const noGame=(GAME===null||GAME===undefined), mjOn=(GAME==="mahjong"), brOn=(GAME==="bridge");
   const auto=autoLayer();
   if(auto!==lastAuto){ lastAuto=auto; VIEW=0; }   // real state change wins over a manual peek
   let L=VIEW||auto;
   if(noGame) L=1;                                  // no game picked -> only layer 1 exists
   if(L===3&&!mjOn&&S&&S.phase==="lobby") L=2;      // no table dealt yet
   if(L===3&&mjOn&&S&&S.phase!=="play") L=2;
-  const l3ok=(!noGame)&&(mjOn? S.phase==="play" : S.phase!=="lobby");
+  if(L===3&&brOn&&S&&S.phase!=="play") L=2;
+  const l3ok=(!noGame)&&((mjOn||brOn)? S.phase==="play" : S.phase!=="lobby");
   ["L1","L2","L3"].forEach((id,k)=>{ const b=document.getElementById(id);
     b.classList.toggle("on",L===k+1); b.disabled=(k>0&&noGame)||(k===2&&!l3ok); });
   document.getElementById("peekLbl").classList.toggle("hidden",L===auto);
   document.getElementById("portal").classList.toggle("hidden",L!==1);
-  document.getElementById("lobby").classList.toggle("hidden",!(L===2&&!mjOn&&!noGame));
-  document.getElementById("game").classList.toggle("hidden",!(L===3&&!mjOn&&!noGame));
+  document.getElementById("lobby").classList.toggle("hidden",!(L===2&&!mjOn&&!brOn&&!noGame));
+  document.getElementById("game").classList.toggle("hidden",!(L===3&&!mjOn&&!brOn&&!noGame));
   document.getElementById("mjLobby").classList.toggle("hidden",!(L===2&&mjOn));
   document.getElementById("mjGame").classList.toggle("hidden",!(L===3&&mjOn));
+  document.getElementById("brLobby").classList.toggle("hidden",!(L===2&&brOn));
+  document.getElementById("brGame").classList.toggle("hidden",!(L===3&&brOn));
   if(L===1){ renderPortal(); return; }
+  if(brOn){ renderBRHost(L); return; }
   if(mjOn){ renderMJ(); return; }
   if(L===2){
     const ul=document.getElementById("lobbyList");
     ul.innerHTML=S.players.length? S.players.map(p=>'<li>'+(p.avatar?'<span class="av" style="background-image:url('+p.avatar+')"></span>':'📱')+' '+esc(p.name)
       +(p.connected?'':' <span class="badge off">offline</span>')
-      +' <button class="kick" onclick="if(confirm(\\'Remove this player?\\'))api(\\'/api/kick\\',{id:\\''+p.id+'\\'})">remove</button></li>').join("")
+      +'</li>').join("")
       :'<li style="color:var(--mut)">Waiting for phones…</li>';
     return;
   }
@@ -1925,17 +3229,168 @@ function openStats(){
   document.getElementById("statsPanel").classList.remove("hidden");
 }
 function closeStats(){document.getElementById("statsPanel").classList.add("hidden");}
+
+/* ---- bridge (host) ---- */
+const BST=["\u2663","\u2666","\u2665","\u2660","NT"], BSE=["N","E","S","W"];
+const BSEZH=["\u5317 N","\u6771 E","\u5357 S","\u897F W"];
+function bStrainHTML(st){ const t=BST[st]; return (st===1||st===2)?'<span class="redS">'+t+'</span>':t; }
+function bCallHTML(c){
+  if(c.t==="P") return "Pass";
+  if(c.t==="X") return '<b style="color:var(--warn)">X</b>';
+  if(c.t==="XX") return '<b style="color:#b02c22">XX</b>';
+  return c.lvl+bStrainHTML(c.str);
+}
+function bContractHTML(c){
+  if(!c) return "\u2014";
+  return c.lvl+bStrainHTML(c.str)+(c.dbl===1?' <b style="color:var(--warn)">X</b>':c.dbl===2?' <b style="color:#b02c22">XX</b>':"")
+    +' <span style="font-size:.8rem;color:var(--mut)">by '+BSE[c.declarer]+'</span>';
+}
+function brAuctionHTML(b){
+  const cells=[]; for(let i=0;i<b.dealer;i++) cells.push(null);
+  b.auction.forEach(c=>cells.push(c));
+  let h='<table class="auc"><thead><tr>'+BSE.map((x,i)=>'<th'+(i===b.dealer?' class="dl"':'')+'>'+x+(i===b.dealer?' \u25b6':'')+'</th>').join("")+'</tr></thead><tbody>';
+  const rows=Math.max(1,Math.ceil(cells.length/4));
+  for(let r=0;r<rows;r++){ h+='<tr>';
+    for(let k=0;k<4;k++){ const c=cells[r*4+k];
+      const isCur=(b.stage==="auction"&&(r*4+k)===cells.length&&((r*4+k)%4)===b.turn);
+      h+='<td'+(isCur?' class="cur"':'')+'>'+(c?bCallHTML(c):(isCur?'\u2026':''))+'</td>'; }
+    h+='</tr>'; }
+  h+='</tbody></table>';
+  if(b.contract) h+='<div style="margin-top:8px;font-size:1.15rem;font-weight:700">\u5b9a\u7d04 Contract: '+bContractHTML(b.contract)+'</div>';
+  return h;
+}
+function brScoreHTML(b){
+  const R=b.rub, N=["N/S","E/W"];
+  let h='<table class="rub"><thead><tr><th></th><th>N/S</th><th>E/W</th></tr></thead><tbody>';
+  h+='<tr><td>\u7dda\u4e0a Above</td><td>'+R.above[0]+'</td><td>'+R.above[1]+'</td></tr>';
+  h+='<tr class="ln"><td>\u7dda\u4e0b Below</td><td>'+R.below[0]+'</td><td>'+R.below[1]+'</td></tr>';
+  h+='<tr><td>\u76e4\u6578 Games</td><td>'+R.games[0]+'</td><td>'+R.games[1]+'</td></tr>';
+  h+='<tr><td><b>\u7e3d\u5206 Total</b></td><td><b>'+R.total[0]+'</b></td><td><b>'+R.total[1]+'</b></td></tr>';
+  h+='<tr><td>\u5c40\u76e4 Rubbers</td><td>'+R.rubbers[0]+'</td><td>'+R.rubbers[1]+'</td></tr>';
+  h+='</tbody></table>';
+  if(R.hist&&R.hist.length){
+    h+='<div style="margin-top:8px;font-size:.72rem;color:var(--mut)">\u6700\u8fd1\u5404\u526f</div>';
+    h+='<div style="font-size:.76rem;line-height:1.6">'+R.hist.slice(0,6).map(function(x){
+      return '#'+x.board+' '+x.contract+' '+(x.res>=0?('+'+x.res):x.res); }).join('<br>')+'</div>';
+  }
+  return h;
+}
+function brResultHTML(b){
+  if(!b.handOver||!b.result) return "";
+  const r=b.result;
+  if(r.passedOut) return '<div class="brResult"><h4>\u56db\u5bb6\u5168 Pass \u2014 \u91cd\u767c\uff5cPassed out</h4></div>';
+  let h='<div class="brResult"><h4>'+r.contract+' \u2014 '+(r.made?(r.res===0?'\u525b\u597d\u6210\u7d04 made exactly':'\u6210\u7d04 +'+r.res):'\u5012 '+(-r.res)+' \u58a9 down '+(-r.res))
+    +'　('+r.won+'/'+r.need+' \u58a9)</h4><table>';
+  r.lines.forEach(function(x){ h+='<tr><td>'+x.k+'</td><td class="n">'+(x.side===0?'N/S':'E/W')+' +'+x.v+'</td></tr>'; });
+  if(r.gameWon!==null&&r.gameWon!==undefined) h+='<tr><td><b>\u2605 '+(r.gameWon===0?'N/S':'E/W')+' \u62ff\u4e0b\u4e00\u76e4 GAME</b></td><td class="n"></td></tr>';
+  if(r.rubberWon!==null&&r.rubberWon!==undefined) h+='<tr><td><b>\u2605\u2605 '+(r.rubberWon===0?'N/S':'E/W')+' \u8d0f\u5f97\u5c40\u76e4 RUBBER</b></td><td class="n">+'+r.rubBonus+'</td></tr>';
+  h+='</table></div>';
+  return h;
+}
+function brSeatBox(b,s,cls){
+  const st=b.seats[s]; if(!st) return "";
+  const turn=(b.stage!=="over"&&b.turn===s&&!b.handOver);
+  const badges=(s===b.declarer?'<span class="badge dec">\u838a\u5bb6 DECL</span>':"")
+    +(b.vuln[s%2]?'<span class="badge vul">VUL</span>':"")
+    +(st.auto?'<span class="badge ai">\u4ee3\u6253</span>':(st.isAI?'<span class="badge ai">AI</span>':""))
+    +(st.connected?"":'<span class="badge off">off</span>');
+  // CIO 2026-08-23\uff1a\u4eba\u4e0d\u5728\u5c31\u8b93\u96fb\u8166\u63a5\u624b\uff0c\u8ab0\u6309\u90fd\u7b97
+  const autoBtn = st.isAI ? "" :
+    (' <button class="miniBtn" onclick="api(\\'/api/br/auto\\',{seat:'+s+'})">'+(st.auto?'\u9084\u539f':'\u4ee3\u6253')+'</button>');
+  let h='<div class="brSeat '+cls+(turn?' turn':'')+'"><div class="hd"><span class="badge seat">'+BSEZH[s]+'</span>'
+    +(st.avatar?'<span class="av" style="background-image:url('+st.avatar+')"></span>':"")
+    +esc(st.name)+badges+autoBtn+'<span class="rt">'+st.cards+' \u5f35</span></div>';
+  if(st.hand){
+    h+='<div class="dh">';
+    [0,1,2,3].forEach(function(su){
+      const cs=st.hand.filter(function(c){return c.s===su;}).sort(function(a,b2){return b2.r-a.r;});
+      if(!cs.length) return;
+      h+='<div class="brSuitRow"><span class="sl'+((su===1||su===2)?' redS':'')+'">'+["\u2660","\u2665","\u2666","\u2663"][su]+'</span>'
+        +cs.map(function(c){return cardHTML(c,"sm");}).join("")+'</div>';
+    });
+    h+='</div>';
+  }
+  return h+'</div>';
+}
+function renderBRHost(L){
+  const b=S;
+  if(L===2){
+    const ul=document.getElementById("brList");
+    const hs=(window.__roster||[]);
+    ul.innerHTML= hs.length? hs.map(function(p,i){ return '<li>'+(p.avatar?'<span class="av" style="background-image:url('+p.avatar+')"></span>':'\ud83d\udcf1')
+        +' <b>'+(i<4?BSE[i]:"\u2014")+'</b> '+esc(p.name)+(p.connected===false?' <span class="badge off">offline</span>':'')
+        +' <button class="kick" onclick="if(confirm(\\'Remove this player?\\'))api(\\'/api/kick\\',{id:\\''+p.id+'\\'})">remove</button></li>'; }).join("")
+      : '<li style="color:var(--mut)">Waiting for phones\u2026</li>';
+    return;
+  }
+  document.getElementById("brTag").innerHTML='\u7b2c '+b.board+' \u526f \u00b7 \u767c\u724c '+BSE[b.dealer]
+    +' \u00b7 '+bContractHTML(b.contract)
+    +' \u00b7 \u58a9\u6578 N/S <b>'+b.tricks[0]+'</b> \u2013 E/W <b>'+b.tricks[1]+'</b>'
+    +' \u00b7 \u5df2\u6253 '+b.played+'/13';
+  document.getElementById("brBanner").textContent=b.banner||"";
+  document.getElementById("brLog").textContent=(b.log||[]).slice(1,4).join("　·　");
+  document.getElementById("brPace").textContent="\u7bc0\u594f\uff1a"+(b.pace===1?"\u5feb":"\u6162");
+  document.getElementById("brPace").classList.toggle("on",b.pace!==1);
+  document.getElementById("brNextBtn").classList.toggle("hidden",!b.handOver);
+  let tbl="";
+  tbl+=brSeatBox(b,0,"top");
+  tbl+=brSeatBox(b,3,"left");
+  tbl+=brSeatBox(b,1,"right");
+  tbl+=brSeatBox(b,2,"bottom");
+  const pos=["tN","tE","tS","tW"];
+  let mid='<div class="brCenter">';
+  if(b.stage==="auction"){
+    mid+='<div style="font-size:1.15rem;font-weight:700">\u53eb\u724c\u4e2d AUCTION</div>'
+      +'<div style="font-size:.9rem">\u8f2a\u5230 <b>'+BSE[b.turn]+'</b></div>';
+  } else {
+    const show=(b.trick&&b.trick.length)?b.trick:(b.lastTrick?b.lastTrick.cards:[]);
+    const isLast=(!b.trick||!b.trick.length)&&b.lastTrick;
+    mid+='<div class="brTrick">';
+    [0,1,2,3].forEach(function(s){
+      const x=show.filter(function(y){return y.seat===s;})[0];
+      mid+='<div class="'+pos[s]+'">'+(x?cardHTML(x.card,""):'<div class="card slot"></div>')+'</div>';
+    });
+    mid+='<div class="tM">'+(isLast?('\u4e0a\u4e00\u58a9<br>'+BSE[b.lastTrick.win]+' \u8d0f'):'')+'</div></div>';
+  }
+  mid+='</div>';
+  document.getElementById("brTableBox").innerHTML=tbl+mid;
+  document.getElementById("brAuction").innerHTML=brAuctionHTML(b);
+  document.getElementById("brResultBox").innerHTML=brResultHTML(b);
+  document.getElementById("brScore").innerHTML=brScoreHTML(b);
+}
+
 /* ---- portal + mahjong (host) ---- */
 try{ new QRCode(document.getElementById("qr3"),{text:joinUrl,width:150,height:150}); }catch(e){}
 ${PORTAL_JS}
 const MJN=["一","二","三","四","五","六","七","八","九"],MJH=["東","南","西","北","中","發","白"],MJF=["春","夏","秋","冬","梅","蘭","菊","竹"];
 function _dots(n){var L={1:[[17,24,7]],2:[[17,14,5.2],[17,34,5.2]],3:[[9,12,5],[17,24,5],[25,36,5]],4:[[11,14,5],[23,14,5],[11,34,5],[23,34,5]],5:[[11,13,4.6],[23,13,4.6],[17,24,4.6],[11,35,4.6],[23,35,4.6]],6:[[11,12,4.3],[23,12,4.3],[11,24,4.3],[23,24,4.3],[11,36,4.3],[23,36,4.3]],7:[[9,11,3.9],[17,11,3.9],[25,11,3.9],[13,24,3.9],[21,24,3.9],[13,37,3.9],[21,37,3.9]],8:[[9,11,3.7],[17,11,3.7],[25,11,3.7],[9,24,3.7],[25,24,3.7],[9,37,3.7],[17,37,3.7],[25,37,3.7]],9:[[9,11,3.7],[17,11,3.7],[25,11,3.7],[9,24,3.7],[17,24,3.7],[25,24,3.7],[9,37,3.7],[17,37,3.7],[25,37,3.7]]};return L[n]||L[1];}
+function _bamboo(n){
+  var G="#2f7d3e", B="#1c6fb0", R="#a3282a";
+  var L={
+    2:[[17,15,G],[17,33,G]],
+    3:[[17,13,G],[10,34,G],[24,34,G]],
+    4:[[11,15,G],[23,15,B],[11,33,B],[23,33,G]],
+    5:[[10,13,G],[24,13,G],[17,24,R],[10,35,G],[24,35,G]],
+    6:[[9,15,G],[17,15,B],[25,15,G],[9,33,G],[17,33,B],[25,33,G]],
+    7:[[17,10,R],[9,26,G],[17,26,B],[25,26,G],[9,39,G],[17,39,B],[25,39,G]],
+    8:[[8,14,G],[15,14,G],[22,14,G],[29,14,G],[8,34,B],[15,34,B],[22,34,B],[29,34,B]],
+    9:[[9,12,G],[17,12,B],[25,12,G],[9,24,G],[17,24,B],[25,24,G],[9,36,G],[17,36,B],[25,36,G]]
+  };
+  return L[n]||L[2];
+}
+/* 一根竹：直桿 + 兩端的節。h 是這一列可以用的高度 */
+function _stick(x,y,col,h){
+  var half=h/2;
+  return '<rect x="'+(x-2)+'" y="'+(y-half)+'" width="4" height="'+h+'" rx="2" fill="'+col+'"/>'
+       + '<rect x="'+(x-3.2)+'" y="'+(y-half+h*0.30)+'" width="6.4" height="1.6" rx="0.8" fill="'+col+'" opacity="0.85"/>'
+       + '<rect x="'+(x-3.2)+'" y="'+(y+half-h*0.30-1.6)+'" width="6.4" height="1.6" rx="0.8" fill="'+col+'" opacity="0.85"/>';
+}
 function tsvg(t){
   var s='<svg viewBox="0 0 34 48" width="100%" height="100%">';
   function tx(str,y,fill,size){return '<text x="17" y="'+y+'" text-anchor="middle" font-family="serif" font-weight="700" font-size="'+size+'" fill="'+fill+'">'+str+'</text>';}
   if(t<9){ s+=tx(MJN[t],20,"#a3282a",16)+tx("萬",43,"#a3282a",15); }
   else if(t<18){ var n=t-8; if(n===1){ s+='<circle cx="17" cy="24" r="10" fill="none" stroke="#1c6fb0" stroke-width="2.2"/><circle cx="17" cy="24" r="6" fill="none" stroke="#a3282a" stroke-width="2"/><circle cx="17" cy="24" r="2.6" fill="#2f7d3e"/>'; } else _dots(n).forEach(function(p){ s+='<circle cx="'+p[0]+'" cy="'+p[1]+'" r="'+p[2]+'" fill="#fff" stroke="#1c6fb0" stroke-width="1.5"/><circle cx="'+p[0]+'" cy="'+p[1]+'" r="'+(p[2]*0.42)+'" fill="#a3282a"/>'; }); }
-  else if(t<27){ var m=t-17; if(m===1){ s+='<ellipse cx="17" cy="27" rx="6" ry="8" fill="#2f7d3e"/><circle cx="17" cy="17" r="4.4" fill="#2f7d3e"/><path d="M17 12 L22 9 L18.5 15 Z" fill="#a3282a"/><circle cx="18.6" cy="16" r="1" fill="#fff"/>'; } else _dots(m).forEach(function(p){ var h=p[2]*2.7; s+='<rect x="'+(p[0]-2)+'" y="'+(p[1]-h/2)+'" width="4" height="'+h+'" rx="2" fill="#2f7d3e"/><rect x="'+(p[0]-2)+'" y="'+(p[1]-1)+'" width="4" height="2" fill="#14501f"/>'; }); }
+  else if(t<27){ var m=t-17; if(m===1){ s+='<ellipse cx="17" cy="27" rx="6" ry="8" fill="#2f7d3e"/><circle cx="17" cy="17" r="4.4" fill="#2f7d3e"/><path d="M17 12 L22 9 L18.5 15 Z" fill="#a3282a"/><circle cx="18.6" cy="16" r="1" fill="#fff"/>'; } else { var bb=_bamboo(m); var bh=(m>=9)?9:((m>=7)?10:(m>=6?13:15)); bb.forEach(function(p){ s+=_stick(p[0],p[1],p[2],bh); }); } }
   else if(t<31){ s+=tx(["東","南","西","北"][t-27],31,"#25324a",20); }
   else if(t===31){ s+=tx("中",31,"#b02c22",21); }
   else if(t===32){ s+=tx("發",31,"#1e7a3c",21); }
@@ -1955,7 +3410,7 @@ function meldHTML(m){
   (m.tiles||[]).forEach(function(t,i){ h+=mtile(m.t==="angang"&&(i===0||i===3)?null:t,true); });
   return h+'</span>';
 }
-function backs(n){ let h=""; for(let k=0;k<n;k++) h+=mtile(null,true); return h; }
+function backs(n){ let h='<span class="backStrip">'; for(let k=0;k<n;k++) h+='<i class="backBar"></i>'; return h+'<b class="backNum">'+n+'</b></span>'; }
 function renderMJ(){
   if(S.phase!=="play"){
     const ul=document.getElementById("mjList");
@@ -2032,8 +3487,9 @@ function renderMJ(){
 /* ================= PLAYER (PHONE) PAGE ================= */
 const PLAYER_HTML=`<!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"><title>盧家遊樂園 — 我的牌</title>
-<style>${CSS}${PORTAL_CSS}
+<style>${CSS}${PORTAL_CSS}${BRIDGE_CSS}
 .wrap{max-width:440px;margin:0 auto;padding:16px 14px 30px;}
+body.br .wrap{max-width:620px;}
 h1{font-size:1.3rem;} .sub{color:var(--mut);font-size:.78rem;margin:2px 0 16px;}
 input[type=text]{width:100%;padding:13px;border:1px solid var(--line);border-radius:10px;font-size:1.05rem;background:#fff;}
 .joinBtn{margin-top:12px;width:100%;padding:14px;border:0;border-radius:10px;background:var(--felt);color:#fff;font-size:1.05rem;font-weight:700;cursor:pointer;}
@@ -2082,6 +3538,17 @@ body.mj .wrap{max-width:980px;}
 .rack{display:flex;gap:3px;flex-wrap:nowrap;overflow-x:auto;padding:12px 4px 4px;align-items:flex-end;}
 .rack .mtile{width:42px;height:58px;cursor:pointer;}
 .rack .mtile.sel{transform:translateY(-9px);outline:3px solid var(--gold);}
+.rack .mtile.pick{transform:translateY(-6px);outline:3px solid var(--felt);}
+.mjTidyBar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:7px;}
+.tdBtn{border:1px solid var(--line);background:#fff;border-radius:8px;padding:7px 11px;font-size:.8rem;cursor:pointer;color:var(--ink);}
+.tdBtn.on{background:#2f7d3e;color:#fff;border-color:#2f7d3e;font-weight:700;}
+.tdBtn.go{background:var(--gold);border-color:var(--gold);color:#3d2f10;font-weight:700;}
+.tdNote{font-size:.72rem;color:var(--mut);}
+.mjGrp{display:inline-block;vertical-align:top;border:1px solid var(--line);border-radius:10px;
+background:#fbf8ef;padding:2px 5px 5px;margin:0 6px 6px 0;}
+.mjGrpHd{display:flex;align-items:center;gap:6px;font-size:.66rem;color:var(--mut);letter-spacing:.1em;padding:2px 2px 0;}
+.mjGrpHd button{margin-left:auto;border:0;background:none;color:#b45050;font-size:.85rem;cursor:pointer;line-height:1;}
+#mjGroupBox{display:flex;flex-wrap:wrap;}
 .rack .gap{width:14px;flex:none;}
 .actRow{display:flex;gap:7px;margin:8px 0;flex-wrap:wrap;}
 .actRow button{padding:12px 18px;border:0;border-radius:11px;font-size:1rem;font-weight:700;cursor:pointer;background:#eee7d8;color:var(--ink);}
@@ -2200,13 +3667,36 @@ display:flex;gap:8px;align-items:center;justify-content:center;box-shadow:0 -3px
   <div id="mjClaimBar" class="claimBar hidden"></div>
   <div id="mjActs" class="actRow hidden"></div>
   <div class="myArea" style="text-align:left">
+    <div class="mjTidyBar" id="mjTidyBar"></div>
     <div class="lbl" id="mjRackLbl">手牌</div>
+    <div id="mjGroupBox"></div>
     <div class="rack" id="mjRack"></div>
     <div class="waitsLn" id="mjWaits"></div>
     <div class="mMini" id="mjMine"></div>
   </div>
 </div>
 
+
+<div id="brPlay" class="hidden">
+  <div class="topbar" style="display:flex;gap:10px;align-items:center;font-size:.88rem;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:10px;padding:7px 11px;margin-bottom:8px;">
+    <b id="brMySeat"></b><span id="brMyRole" style="color:var(--mut)"></span>
+    <span id="brMyContract"></span>
+    <span id="brMyTricks" style="margin-left:auto"></span>
+    <span class="brTurnLn" id="brMyTurn" style="flex-basis:100%"></span>
+    <span class="brNote" id="brMyBanner" style="flex-basis:100%"></span>
+  </div>
+  <div id="brBidBox" class="brBox hidden" style="margin-bottom:9px"></div>
+  <div id="brTrickBox" class="brBox hidden" style="margin-bottom:9px"></div>
+  <div class="myArea" style="text-align:left">
+    <div class="lbl" id="brHandLbl">我的牌 MY HAND</div>
+    <div id="brMyHand"></div>
+  </div>
+  <div class="bar" style="flex-wrap:wrap;margin-top:10px">
+    <button class="tbtn" id="brAutoBtn" onclick="brAuto()">電腦代打 Auto</button>
+    <button class="tbtn" style="color:#8c2f2f" onclick="leaveTable()">離座 Leave</button>
+  </div>
+  <div class="brNote" id="brHint" style="margin-top:8px"></div>
+</div>
 </div>
 
 <div id="pBar" class="hidden">
@@ -2223,9 +3713,10 @@ const SUITS=["♠","♥","♦","♣"],RN={11:"J",12:"Q",13:"K",14:"A"};
 const rN=r=>RN[r]||String(r);
 const cardHTML=(c,cls="")=>{const red=(c.s===1||c.s===2);
  return '<div class="card '+cls+(red?' red':'')+'"><span>'+rN(c.r)+'</span><span class="s">'+SUITS[c.s]+'</span></div>';};
+const IS_HOST=false;  // 手機只看，不能移除別人
 let token=localStorage.getItem("pk_token")||null, myName=localStorage.getItem("pk_name")||"";
 let S=null, ME=null, coachOn=true, es=null, wasMyTurn=false;
-let GAME=null, MJME=null, mjSel=null, rackTiles=[], wasClaim=false;
+let GAME=null, MJME=null, mjSel=null, rackTiles=[], wasClaim=false, BRME=null;
 
 async function join(){
   const nm=document.getElementById("nm").value.trim();
@@ -2259,7 +3750,8 @@ function openES(){
   es=new EventSource("/events?token="+token);
   es.onerror=function(){ if(esRetry) return;
     esRetry=setTimeout(function(){ esRetry=null; openES(); },2000); };
-  es.onmessage=e=>{const d=JSON.parse(e.data); GAME=d.game; S=d.pub; MEIN=d.me; pRender(); };
+  es.onmessage=e=>{const d=JSON.parse(e.data); GAME=d.game; S=d.pub; MEIN=d.me;
+    window.__code=d.code; window.__setup=d.setup; pRender(); };
 }
 let PV=0, pLastAuto="", MEIN=null;
 function pView(n){ PV=n; pRender(); }
@@ -2285,12 +3777,17 @@ function pRender(){
   document.getElementById("pSeat").classList.toggle("hidden",L!==2);
   document.getElementById("play").classList.toggle("hidden",!(L===3&&GAME==="poker"));
   document.getElementById("mjPlay").classList.toggle("hidden",!(L===3&&GAME==="mahjong"));
+  document.getElementById("brPlay").classList.toggle("hidden",!(L===3&&GAME==="bridge"));
+  document.body.classList.toggle("br",GAME==="bridge"&&L===3);
   document.getElementById("btnCoach").textContent=coachLabel();
   renderPortal(); paintSeat();
   if(GAME==="poker"){
     if(!MEIN){ document.getElementById("waitLine").textContent="You've been removed from the table.";
       document.getElementById("pubLine").textContent="Ask the host to end the session if you want to rejoin."; return; }
     ME=MEIN; if(L===3) paint();
+  } else if(GAME==="bridge"){
+    BRME=MEIN;
+    if(L===3) brPaint();
   } else if(GAME==="mahjong"){
     MJME=MEIN;
     if(!MJME||!MJME.myTurn) mjSel=null;
@@ -2427,16 +3924,142 @@ document.getElementById("avFile").addEventListener("change",function(){
   img.onerror=function(){ alert("Could not read that photo."); };
   img.src=URL.createObjectURL(f);
 });
+
+/* ---- bridge (phone) ---- */
+const BST=["\u2663","\u2666","\u2665","\u2660","NT"], BSE=["N","E","S","W"], BSU=["\u2660","\u2665","\u2666","\u2663"];
+const BSEZH=["\u5317 North","\u6771 East","\u5357 South","\u897F West"];
+function bStrainHTML(st){ const t=BST[st]; return (st===1||st===2)?'<span class="redS">'+t+'</span>':t; }
+function bCallHTML(c){ if(c.t==="P") return "Pass"; if(c.t==="X") return "X"; if(c.t==="XX") return "XX";
+  return c.lvl+bStrainHTML(c.str); }
+function bContractHTML(c){ if(!c) return "\u2014";
+  return c.lvl+bStrainHTML(c.str)+(c.dbl===1?" X":c.dbl===2?" XX":"")+" by "+BSE[c.declarer]; }
+function cid(c){ return c.s*13+(c.r-2); }
+function brCall(call){ api("/api/br/call",{token:token,call:call}); }
+function brPlayCard(id){ api("/api/br/play",{token:token,card:id}); }
+function brAuto(){ if(BRME&&BRME.seat>=0) api("/api/br/auto",{seat:BRME.seat}); }
+function brBidBoxHTML(me){
+  const c=me.calls; if(!c) return "";
+  let h='<div style="font-size:.7rem;letter-spacing:.14em;color:var(--mut);margin-bottom:6px">\u53eb\u724c BIDDING BOX</div><div class="bidGrid">';
+  for(var l=1;l<=7;l++) for(var st=0;st<5;st++){
+    var v=l*5+st, ok=c.bids.indexOf(v)>=0;
+    h+='<button class="'+(ok?'':'off')+'" '+(ok?'onclick="brCall({t:\\'B\\',lvl:'+l+',str:'+st+'})"':'disabled')+'>'+l+bStrainHTML(st)+'</button>';
+  }
+  h+='</div><div class="bidRow"><button class="bPass" onclick="brCall({t:\\'P\\'})">Pass</button>'
+   +'<button class="bDbl"'+(c.dbl?'':' disabled')+' onclick="brCall({t:\\'X\\'})">X \u52a0\u500d</button>'
+   +'<button class="bRdbl"'+(c.rdbl?'':' disabled')+' onclick="brCall({t:\\'XX\\'})">XX \u518d\u52a0\u500d</button></div>';
+  return h;
+}
+function brHandHTML(cards,legal,live){
+  const set={}; (legal||[]).forEach(function(c){ set[cid(c)]=1; });
+  let h='<div class="brHand'+(live?' live':'')+'">';
+  [0,1,2,3].forEach(function(su){
+    const cs=cards.filter(function(c){return c.s===su;}).sort(function(a,b){return b.r-a.r;});
+    if(!cs.length) return;
+    h+='<div class="brSuitRow" style="flex-basis:100%"><span class="sl'+((su===1||su===2)?' redS':'')+'">'+BSU[su]+'</span>';
+    h+=cs.map(function(c){ const id=cid(c); const ok=live&&set[id];
+      return '<span '+(ok?'onclick="brPlayCard('+id+')"':'')+'>'+cardHTML(c,ok?"ok":(live?"no":""))+'</span>'; }).join("");
+    h+='</div>';
+  });
+  return h+'</div>';
+}
+function brTrickHTML(b,me){
+  const show=(b.trick&&b.trick.length)?b.trick:(b.lastTrick?b.lastTrick.cards:[]);
+  const isLast=(!b.trick||!b.trick.length)&&b.lastTrick;
+  // \u8ddf\u5927\u87a2\u5e55\u4e00\u6a21\u4e00\u6a23\u7684\u56fa\u5b9a\u65b9\u4f4d\uff1aN \u4e0a\u3001E \u53f3\u3001S \u4e0b\u3001W \u5de6\u3002
+  // \u624b\u6a5f\u4e0d\u518d\u628a\u81ea\u5df1\u8f49\u5230\u4e0b\u9762 \u2014\u2014 \u4e00\u8f49\uff0c\u5de6\u53f3\u5169\u5bb6\u5c31\u8ddf\u96fb\u8996\u4e0a\u5c0d\u8abf\uff0c\u770b\u8d77\u4f86\u50cf\u93e1\u50cf\u3002
+  const pos=["tN","tE","tS","tW"];
+  let h='<div style="font-size:.7rem;letter-spacing:.14em;color:var(--mut);margin-bottom:4px">'
+    +(isLast?"\u4e0a\u4e00\u58a9 LAST TRICK \u2014 "+BSE[b.lastTrick.win]+" \u8d0f":"\u9019\u4e00\u58a9 THIS TRICK")
+    +'　\u5df2\u6253 '+b.played+'/13</div><div class="brTrick" style="min-height:150px">';
+  [0,1,2,3].forEach(function(s){
+    const mine=(s===me.seat);
+    const x=show.filter(function(y){return y.seat===s;})[0];
+    h+='<div class="'+pos[s]+(mine?' meSlot':'')+'" style="text-align:center">'
+      +'<div style="font-size:.6rem;'+(mine?'color:var(--felt);font-weight:700':'color:var(--mut)')+'">'
+      +BSE[s]+(mine?' \u4f60':'')+'</div>'
+      +(x?cardHTML(x.card,"sm"):'<div class="card sm slot" style="border-color:#cfc7b2"></div>')+'</div>';
+  });
+  return h+'</div>';
+}
+function brPaint(){
+  const b=S, me=BRME;
+  const seatEl=document.getElementById("brMySeat");
+  if(!me||me.seat<0){ seatEl.textContent="\u4f60\u4e0d\u5728\u9019\u5834\u724c\u5c40\u88e1";
+    document.getElementById("brMyHand").innerHTML="";
+    document.getElementById("brBidBox").classList.add("hidden");
+    document.getElementById("brHint").textContent="\u4e0b\u4e00\u5834\u958b\u5c40\u6642\u5c31\u6703\u6392\u5230\u4f60\u3002";
+    return; }
+  seatEl.textContent=BSEZH[me.seat];
+  document.getElementById("brMyRole").textContent =
+    me.isDeclarer? "\u838a\u5bb6 Declarer" : me.isDummy? "\u838a\u5bb6\u540c\u4f34 Partner" :
+    (b.contract? "\u9632\u5b88 Defender" : "");
+  document.getElementById("brMyContract").innerHTML = b.contract? ("\u5b9a\u7d04 "+bContractHTML(b.contract)) : "\u53eb\u724c\u4e2d";
+  document.getElementById("brMyTricks").innerHTML = "N/S <b>"+b.tricks[0]+"</b> \u2013 E/W <b>"+b.tricks[1]+"</b>";
+  document.getElementById("brMyBanner").textContent=b.banner||"";
+  const bid=document.getElementById("brBidBox");
+  const turnLn=document.getElementById("brMyTurn");
+  document.getElementById("brAutoBtn").textContent = me.auto? "\u6062\u5fa9\u81ea\u5df1\u6253 Take back" : "\u96fb\u8166\u4ee3\u6253 Auto";
+  if(b.handOver){
+    turnLn.textContent="\u9019\u526f\u7d50\u675f \u2014 \u770b\u5927\u87a2\u5e55\u7684\u8a08\u5206\uff0c\u4e3b\u6a5f\u6309\u300c\u4e0b\u4e00\u526f\u300d";
+    bid.classList.add("hidden");
+    document.getElementById("brTrickBox").classList.add("hidden");
+    document.getElementById("brMyHand").innerHTML=brHandHTML(me.hand,[],false);
+    document.getElementById("brHint").textContent="";
+    return;
+  }
+  if(b.stage==="auction"){
+    if(me.myTurn){ turnLn.textContent="\u8f2a\u5230\u4f60\u53eb\u724c \u2014 YOUR CALL";
+      bid.innerHTML=brBidBoxHTML(me); bid.classList.remove("hidden"); }
+    else { turnLn.textContent="\u7b49 "+BSE[b.turn]+" \u53eb\u724c\u2026"; bid.classList.add("hidden"); }
+    document.getElementById("brTrickBox").classList.add("hidden");
+    document.getElementById("brMyHand").innerHTML=brHandHTML(me.hand,[],false);
+    document.getElementById("brHint").textContent="\u53eb\u724c\u898f\u5247\uff1a\u53ea\u80fd\u53eb\u6bd4\u4e0a\u4e00\u500b\u9ad8\u7684\u5b9a\u7d04\uff1b\u53ea\u80fd\u52a0\u500d\u5c0d\u624b\u7684\u5b9a\u7d04\uff1b\u4e09\u5bb6 Pass \u5c31\u5b9a\u7d04\u3002";
+    return;
+  }
+  bid.classList.add("hidden");
+  const live=!!me.myTurn;
+  const tb=document.getElementById("brTrickBox");
+  tb.classList.remove("hidden"); tb.innerHTML=brTrickHTML(b,me);
+  document.getElementById("brHandLbl").textContent = "\u6211\u7684\u724c MY HAND";
+  document.getElementById("brMyHand").innerHTML=brHandHTML(me.hand,live?me.legal:[],live);
+  turnLn.textContent = live ? "\u8f2a\u5230\u4f60\u51fa\u724c \u2014 YOUR CARD"
+    : ("\u7b49 "+BSE[b.turn]+" \u51fa\u724c\u2026");
+  document.getElementById("brHint").textContent = live
+    ? "\u5fc5\u9808\u8ddf\u82b1\u8272\uff1b\u6c92\u6709\u8a72\u82b1\u8272\u624d\u53ef\u4ee5\u51fa\u5225\u7684\u3002"
+    : (b.lastTrick? ("\u4e0a\u4e00\u58a9 "+BSE[b.lastTrick.win]+" \u8d0f"):"");
+}
+
 /* ---- portal + mahjong (phone) ---- */
 const MJN=["一","二","三","四","五","六","七","八","九"],MJH=["東","南","西","北","中","發","白"],MJF=["春","夏","秋","冬","梅","蘭","菊","竹"];
 function mjNm(t){ if(t<9)return MJN[t]+"萬"; if(t<18)return MJN[t-9]+"筒"; if(t<27)return MJN[t-18]+"條"; if(t<34)return MJH[t-27]; return MJF[t-34]; }
 function _dots(n){var L={1:[[17,24,7]],2:[[17,14,5.2],[17,34,5.2]],3:[[9,12,5],[17,24,5],[25,36,5]],4:[[11,14,5],[23,14,5],[11,34,5],[23,34,5]],5:[[11,13,4.6],[23,13,4.6],[17,24,4.6],[11,35,4.6],[23,35,4.6]],6:[[11,12,4.3],[23,12,4.3],[11,24,4.3],[23,24,4.3],[11,36,4.3],[23,36,4.3]],7:[[9,11,3.9],[17,11,3.9],[25,11,3.9],[13,24,3.9],[21,24,3.9],[13,37,3.9],[21,37,3.9]],8:[[9,11,3.7],[17,11,3.7],[25,11,3.7],[9,24,3.7],[25,24,3.7],[9,37,3.7],[17,37,3.7],[25,37,3.7]],9:[[9,11,3.7],[17,11,3.7],[25,11,3.7],[9,24,3.7],[17,24,3.7],[25,24,3.7],[9,37,3.7],[17,37,3.7],[25,37,3.7]]};return L[n]||L[1];}
+function _bamboo(n){
+  var G="#2f7d3e", B="#1c6fb0", R="#a3282a";
+  var L={
+    2:[[17,15,G],[17,33,G]],
+    3:[[17,13,G],[10,34,G],[24,34,G]],
+    4:[[11,15,G],[23,15,B],[11,33,B],[23,33,G]],
+    5:[[10,13,G],[24,13,G],[17,24,R],[10,35,G],[24,35,G]],
+    6:[[9,15,G],[17,15,B],[25,15,G],[9,33,G],[17,33,B],[25,33,G]],
+    7:[[17,10,R],[9,26,G],[17,26,B],[25,26,G],[9,39,G],[17,39,B],[25,39,G]],
+    8:[[8,14,G],[15,14,G],[22,14,G],[29,14,G],[8,34,B],[15,34,B],[22,34,B],[29,34,B]],
+    9:[[9,12,G],[17,12,B],[25,12,G],[9,24,G],[17,24,B],[25,24,G],[9,36,G],[17,36,B],[25,36,G]]
+  };
+  return L[n]||L[2];
+}
+/* 一根竹：直桿 + 兩端的節。h 是這一列可以用的高度 */
+function _stick(x,y,col,h){
+  var half=h/2;
+  return '<rect x="'+(x-2)+'" y="'+(y-half)+'" width="4" height="'+h+'" rx="2" fill="'+col+'"/>'
+       + '<rect x="'+(x-3.2)+'" y="'+(y-half+h*0.30)+'" width="6.4" height="1.6" rx="0.8" fill="'+col+'" opacity="0.85"/>'
+       + '<rect x="'+(x-3.2)+'" y="'+(y+half-h*0.30-1.6)+'" width="6.4" height="1.6" rx="0.8" fill="'+col+'" opacity="0.85"/>';
+}
 function tsvg(t){
   var s='<svg viewBox="0 0 34 48" width="100%" height="100%">';
   function tx(str,y,fill,size){return '<text x="17" y="'+y+'" text-anchor="middle" font-family="serif" font-weight="700" font-size="'+size+'" fill="'+fill+'">'+str+'</text>';}
   if(t<9){ s+=tx(MJN[t],20,"#a3282a",16)+tx("萬",43,"#a3282a",15); }
   else if(t<18){ var n=t-8; if(n===1){ s+='<circle cx="17" cy="24" r="10" fill="none" stroke="#1c6fb0" stroke-width="2.2"/><circle cx="17" cy="24" r="6" fill="none" stroke="#a3282a" stroke-width="2"/><circle cx="17" cy="24" r="2.6" fill="#2f7d3e"/>'; } else _dots(n).forEach(function(p){ s+='<circle cx="'+p[0]+'" cy="'+p[1]+'" r="'+p[2]+'" fill="#fff" stroke="#1c6fb0" stroke-width="1.5"/><circle cx="'+p[0]+'" cy="'+p[1]+'" r="'+(p[2]*0.42)+'" fill="#a3282a"/>'; }); }
-  else if(t<27){ var m=t-17; if(m===1){ s+='<ellipse cx="17" cy="27" rx="6" ry="8" fill="#2f7d3e"/><circle cx="17" cy="17" r="4.4" fill="#2f7d3e"/><path d="M17 12 L22 9 L18.5 15 Z" fill="#a3282a"/><circle cx="18.6" cy="16" r="1" fill="#fff"/>'; } else _dots(m).forEach(function(p){ var h=p[2]*2.7; s+='<rect x="'+(p[0]-2)+'" y="'+(p[1]-h/2)+'" width="4" height="'+h+'" rx="2" fill="#2f7d3e"/><rect x="'+(p[0]-2)+'" y="'+(p[1]-1)+'" width="4" height="2" fill="#14501f"/>'; }); }
+  else if(t<27){ var m=t-17; if(m===1){ s+='<ellipse cx="17" cy="27" rx="6" ry="8" fill="#2f7d3e"/><circle cx="17" cy="17" r="4.4" fill="#2f7d3e"/><path d="M17 12 L22 9 L18.5 15 Z" fill="#a3282a"/><circle cx="18.6" cy="16" r="1" fill="#fff"/>'; } else { var bb=_bamboo(m); var bh=(m>=9)?9:((m>=7)?10:(m>=6?13:15)); bb.forEach(function(p){ s+=_stick(p[0],p[1],p[2],bh); }); } }
   else if(t<31){ s+=tx(["東","南","西","北"][t-27],31,"#25324a",20); }
   else if(t===31){ s+=tx("中",31,"#b02c22",21); }
   else if(t===32){ s+=tx("發",31,"#1e7a3c",21); }
@@ -2458,6 +4081,7 @@ function mjPost(u,b){ b.token=token;
 }
 function toggleRot(){ var e=document.getElementById("mjPlay"); var on=!e.classList.contains("rot"); e.classList.toggle("rot",on); localStorage.setItem("mj_rot",on?"1":"0"); }
 function mjPick(i){
+  if(mjTidy) return;                       // 理牌模式只選牌，不出牌
   if(!MJME||!MJME.myTurn){ mjSel=null; return; }
   if(mjSel===i){ mjDoDiscard(); return; }
   mjSel=i; mjPaint();
@@ -2482,6 +4106,99 @@ function mjCdTick(){
   const s=Math.max(0,Math.ceil((S.claimUntil-Date.now())/1000));
   el.textContent="⏱ "+s+"s";
 }
+
+/* ───────── 麻將理牌：自己分組 + 教練自動分組 ─────────
+   分組完全是這支手機上的整理，伺服器不知道，也不影響任何規則。
+   教練那一份是伺服器算的，但只算你自己的牌。                      */
+let mjGroups = [];                 // [[tile,tile,...], ...]
+let mjTidy = false;                // 理牌模式：可以複選，不會打出去
+let mjMulti = new Set();           // 理牌模式下選起來的位置
+let mjCoach = localStorage.getItem("mj_coach")==="1";
+let mjCoachSig = "", mjCoachSh = null;
+
+function mjHandSig(){
+  if(!MJME) return "";
+  const h=(MJME.hand||[]).slice();
+  if(MJME.drawn!==null&&MJME.drawn!==undefined) h.push(MJME.drawn);
+  return h.slice().sort(function(a,b){return a-b;}).join(",");
+}
+function mjAskCoach(force){
+  if(!MJME||MJME.spectator) return;
+  const sig=mjHandSig();
+  if(!sig) return;
+  if(!force && (!mjCoach || sig===mjCoachSig)) return;
+  mjCoachSig=sig;
+  fetch("/api/mj/groups",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({token:token})}).then(function(r){return r.json();}).then(function(j){
+      if(!j||!j.ok){ if(force&&j&&j.error) alert(j.error); return; }
+      mjGroups=(j.groups||[]).map(function(g){ return g.tiles.slice(); });
+      mjCoachSh=(typeof j.shanten==="number")?j.shanten:null;
+      mjMulti.clear(); mjPaint();
+    });
+}
+function mjToggleCoach(){
+  mjCoach=!mjCoach; localStorage.setItem("mj_coach",mjCoach?"1":"0");
+  if(mjCoach){ mjCoachSig=""; mjAskCoach(true); }
+  else { mjGroups=[]; mjCoachSh=null; mjPaint(); }
+}
+function mjToggleTidy(){ mjTidy=!mjTidy; mjMulti.clear(); mjSel=null; mjPaint(); }
+function mjMakeGroup(){
+  if(mjMulti.size<2) return alert("至少選兩張才分得成一組");
+  const picked=[...mjMulti].map(function(i){ return rackTiles[i]; }).filter(function(t){return t!==undefined;});
+  mjGroups=mjGroups.map(function(g){ return g.filter(function(t){ return picked.indexOf(t)<0; }); })
+                   .filter(function(g){ return g.length; });
+  mjGroups.push(picked.slice().sort(function(a,b){return a-b;}));
+  mjMulti.clear(); mjPaint();
+}
+function mjClearGroups(){ mjGroups=[]; mjMulti.clear(); mjCoachSh=null; mjPaint(); }
+function mjDropGroup(gi){ mjGroups.splice(gi,1); mjPaint(); }
+function mjGroupLabel(g){
+  if(g.length===3){
+    if(g[0]===g[1]&&g[1]===g[2]) return "刻子";
+    const a=g.slice().sort(function(x,y){return x-y;});
+    if(a[0]<27&&a[1]===a[0]+1&&a[2]===a[0]+2) return "順子";
+    return "";
+  }
+  if(g.length===2) return (g[0]===g[1])?"對子":"搭子";
+  if(g.length===4&&g[0]===g[3]) return "槓";
+  return "";
+}
+/* 把手牌照「分組先、散牌後」排出來，回傳顯示順序的牌陣 */
+function mjLayout(hand){
+  const pool=hand.slice();
+  const out=[], strips=[];
+  mjGroups.forEach(function(g,gi){
+    const take=[];
+    for(const t of g){ const k=pool.indexOf(t); if(k>=0){ pool.splice(k,1); take.push(t); } }
+    if(take.length) strips.push({gi:gi,tiles:take});
+  });
+  strips.forEach(function(st){ st.from=out.length; st.tiles.forEach(function(t){ out.push(t); }); });
+  const looseFrom=out.length;
+  pool.sort(function(a,b){return a-b;}).forEach(function(t){ out.push(t); });
+  return {order:out, strips:strips, looseFrom:looseFrom};
+}
+function mjTapTile(i){
+  if(mjTidy){
+    if(mjMulti.has(i)) mjMulti.delete(i); else mjMulti.add(i);
+    mjPaint(); return;
+  }
+  mjPick(i);
+}
+function mjRenderTidyBar(){
+  const bar=document.getElementById("mjTidyBar");
+  if(!bar) return;
+  if(!MJME||MJME.spectator||S.handOver){ bar.innerHTML=""; return; }
+  let h='<button class="tdBtn'+(mjCoach?" on":"")+'" onclick="mjToggleCoach()">教練 '+(mjCoach?"✓":"Coach")+'</button>'
+      + '<button class="tdBtn" onclick="mjAskCoach(true)">幫我理一次</button>'
+      + '<button class="tdBtn'+(mjTidy?" on":"")+'" onclick="mjToggleTidy()">'+(mjTidy?"理牌中 ✓":"自己分組")+'</button>';
+  if(mjTidy){
+    h+='<button class="tdBtn go" onclick="mjMakeGroup()">分成一組 ('+mjMulti.size+')</button>';
+  }
+  if(mjGroups.length) h+='<button class="tdBtn" onclick="mjClearGroups()">清除分組</button>';
+  if(mjCoachSh!==null&&mjCoach) h+='<span class="tdNote">'+(mjCoachSh<=0?"聽牌了！":("還差 "+mjCoachSh+" 步聽牌"))+'</span>';
+  if(mjTidy) h+='<span class="tdNote">理牌模式：點牌只會選起來，不會打出去</span>';
+  bar.innerHTML=h;
+}
 function mjPaint(){
   if(!S) return;
   if(!MJME||MJME.spectator){
@@ -2494,6 +4211,8 @@ function mjPaint(){
     document.getElementById("mjClaimBar").classList.add("hidden");
     document.getElementById("mjActs").classList.add("hidden");
     document.getElementById("mjRack").innerHTML="";
+    document.getElementById("mjGroupBox").innerHTML="";
+    document.getElementById("mjTidyBar").innerHTML="";
     document.getElementById("mjWaits").textContent="";
     document.getElementById("mjMine").innerHTML="";
     return;
@@ -2539,18 +4258,32 @@ function mjPaint(){
   if(MJME.myTurn&&!wasMyTurn&&navigator.vibrate) navigator.vibrate([120,60,120]);
   wasMyTurn=MJME.myTurn;
   // rack
-  rackTiles=(MJME.hand||[]).slice();
-  let rh="";
-  rackTiles.forEach(function(t,i){
-    rh+=mtile(t,false,(mjSel===i?" sel":"")).replace('<div class="','<div onclick="mjPick('+i+')" class="');
+  if(mjCoach) mjAskCoach(false);
+  const lay=mjLayout((MJME.hand||[]).slice());
+  rackTiles=lay.order.slice();
+  function tileHTML(t,i){
+    const cls=(mjSel===i?" sel":"")+(mjMulti.has(i)?" pick":"");
+    return mtile(t,false,cls).replace('<div class="','<div onclick="mjTapTile('+i+')" class="');
+  }
+  let gh="";
+  lay.strips.forEach(function(st){
+    const lb=mjGroupLabel(st.tiles);
+    gh+='<div class="mjGrp"><div class="mjGrpHd">'+(lb||"一組")+'<button onclick="mjDropGroup('+st.gi+')">×</button></div>'
+      +'<div class="rack" style="padding:4px 2px">'
+      +st.tiles.map(function(t,k){ return tileHTML(t,st.from+k); }).join("")+'</div></div>';
   });
+  document.getElementById("mjGroupBox").innerHTML=gh;
+  let rh="";
+  for(let i=lay.looseFrom;i<lay.order.length;i++) rh+=tileHTML(lay.order[i],i);
   if(MJME.drawn!==null&&MJME.drawn!==undefined){
     const di=rackTiles.length;
     rackTiles.push(MJME.drawn);
-    rh+='<span class="gap"></span>'+mtile(MJME.drawn,false,(mjSel===di?" sel":"")).replace('<div class="','<div onclick="mjPick('+di+')" class="');
+    rh+='<span class="gap"></span>'+tileHTML(MJME.drawn,di);
   }
   document.getElementById("mjRack").innerHTML=rh;
-  document.getElementById("mjRackLbl").textContent=MJME.myTurn?(MJME.mustDiscard?"手牌 — 吃/碰後請出一張（點兩下打出）":"手牌 — 點兩下打出"):"手牌";
+  mjRenderTidyBar();
+  document.getElementById("mjRackLbl").textContent= mjTidy? "手牌 — 理牌模式（點選要放同一組的牌）"
+    : (MJME.myTurn?(MJME.mustDiscard?"手牌 — 吃/碰後請出一張（點兩下打出）":"手牌 — 點兩下打出"):"手牌");
   // waits
   const w=MJME.waits||[];
   document.getElementById("mjWaits").textContent=(w.length&&w.length<=9)?("聽："+w.map(mjNm).join("、")):"";
@@ -2602,7 +4335,7 @@ attach(big2, io, { mount: "/dalaoer" });
 if(!process.env.MJ_TEST) server.listen(activePort,"0.0.0.0");
 server.on("listening",()=>{
   const list=allIPs(); const ip=list.length?list[0].ip:"localhost";
-  console.log("\n  LU FAMILY GAME PORTAL — Poker + Taiwan Mahjong");
+  console.log("\n  LU FAMILY GAME PORTAL — Poker + Taiwan Mahjong + Bridge");
   console.log("  ─────────────────────────────────────");
   console.log("  TV / host screen :  http://"+ip+":"+activePort+"/");
   console.log("  Phones join at   :  http://"+ip+":"+activePort+"/join   (QR shown on TV)");

@@ -52,6 +52,8 @@ class Game {
 
     this.hands = E.deal(rng);
     this.playedCards = [];
+    // 誰 PASS 掉了什麼（電腦取樣時用來倒推別人手上有沒有）
+    this.passLog = [[], [], [], []];
     this.history = [];          // 這一局出過的每一手：{seat, cards, label, trick}
     this.trickNo = 1;
     this.current = null;        // 場上最後一手 (identify 結果)
@@ -384,6 +386,14 @@ class Game {
     if (this.isNewRound()) return { ok: false, reason: '你開牌，不能 PASS' };
 
     this.passed[seat] = true;
+    if (this.current) {
+      (this.passLog[seat] = this.passLog[seat] || []).push({
+        size: this.current.size,
+        tiebreak: this.current.tiebreak || 0,
+        tiebreakCard: this.current.size === 1 ? this.current.tiebreak : null,
+        rank: this.current.size === 2 ? Math.floor((this.current.tiebreak || 0) / 4) : null,
+      });
+    }
     this.log.push(`${this.players[seat]} PASS`);
     this._advanceTurn();
     return { ok: true };
@@ -398,6 +408,7 @@ class Game {
     return {
       hands: this.hands.map((h) => [...h]),
       playedCards: [...this.playedCards],
+      passLog: (this.passLog || [[], [], [], []]).map((a) => a.map((x) => ({ ...x }))),
       history: this.history.map((h) => ({ ...h, cards: [...h.cards] })),
       trickNo: this.trickNo,
       current: this.current,
@@ -428,6 +439,7 @@ class Game {
   _restore(snap) {
     this.hands = snap.hands.map((h) => [...h]);
     this.playedCards = [...snap.playedCards];
+    this.passLog = (snap.passLog || [[], [], [], []]).map((a) => a.map((x) => ({ ...x })));
     this.history = snap.history.map((h) => ({ ...h, cards: [...h.cards] }));
     this.trickNo = snap.trickNo;
     this.current = snap.current;

@@ -281,6 +281,7 @@ function render() {
 
 function renderAll() {
   selected = new Set([...selected].filter((c) => state.hand.includes(c)));
+  if (coachOn) applyCoach(false);      // 出過牌之後自動重理
   renderOpponents();
   renderCenter();
   renderSwapMode();
@@ -479,6 +480,46 @@ function pruneGroups() {
     .filter((g) => g.length > 0);
 }
 
+// ───────────────────────────────────────── 教練模式（自動理牌）
+// 伺服器用電腦玩家那一套拆解，把手牌拆成最少的出牌手數，
+// 再把每一組送回來。只看得到自己的牌，看不到別人的 —— 等於旁邊坐了個人幫你理牌。
+let coachOn = localStorage.getItem('dl_coach') === '1';
+let coachSig = '';          // 手牌指紋，變了才重算
+let coachInfo = null;       // {hands, singles}
+
+function handSignature() {
+  return (state && state.hand ? state.hand : []).slice().sort((a, b) => a - b).join(',');
+}
+
+function applyCoach(force) {
+  if (!state || !state.hand || !state.hand.length) return;
+  const sig = handSignature();
+  if (!force && (!coachOn || sig === coachSig)) return;
+  coachSig = sig;
+  socket.emit('suggestGroups', {}, (r) => {
+    if (!r || !r.ok) { if (force) toast(r && r.reason ? r.reason : '理不動', true); return; }
+    groups = (r.groups || []).map((g) => g.cards.slice());
+    coachInfo = { hands: r.hands, singles: r.singles };
+    selected.clear();
+    render();
+  });
+}
+
+function toggleCoach() {
+  coachOn = !coachOn;
+  localStorage.setItem('dl_coach', coachOn ? '1' : '0');
+  if (coachOn) { coachSig = ''; applyCoach(true); }
+  else { groups = []; coachInfo = null; render(); }
+}
+
+/** 理牌用的按鈕（教練／分組／重選）——任何可以選牌的階段都該有 */
+function addTidyButtons(add) {
+  add(coachOn ? '教練 ✓' : '教練 Coach', coachOn ? 'btn-coach-on' : '', () => toggleCoach());
+  if (!coachOn) add('幫我理一次', '', () => applyCoach(true));
+  if (selected.size >= 2) add('分成一組', '', makeGroup);
+  if (selected.size) add('重選', '', () => { selected.clear(); render(); });
+}
+
 /** 把目前選的牌收成一組 */
 function makeGroup() {
   const cards = [...selected].filter((c) => state.hand.includes(c));
@@ -527,6 +568,14 @@ function renderGroups() {
   const box = $('groups');
   if (!box) return;
   pruneGroups();
+  const tally = $('coach-tally');
+  if (tally) {
+    if (coachOn && coachInfo) {
+      tally.classList.remove('hidden');
+      tally.textContent = '教練：這手牌最少 ' + coachInfo.hands + ' 手出得完'
+        + (coachInfo.singles ? '（其中 ' + coachInfo.singles + ' 張孤張）' : '');
+    } else tally.classList.add('hidden');
+  }
   if (!groups.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
   box.classList.remove('hidden');
   box.innerHTML = '';
@@ -693,7 +742,9 @@ function renderActions() {
 
   if (state.phase === 'BET_DECLARE') {
     if (state.declareResponses && state.declareResponses[me.seat] !== undefined) {
-      add('等其他人決定', '', () => {}, true); return;
+      add('等其他人決定', '', () => {}, true);
+      addTidyButtons(add);          // 等別人決定時照樣可以理牌
+      return;
     }
     add('我要對賭', 'btn-danger', () => {
       showSheet(`
@@ -712,16 +763,18 @@ function renderActions() {
     add('不賭', '', () => {
       socket.emit('declareBet', { declare: false }, (r) => { if (!r.ok) toast(r.reason, true); });
     });
+    addTidyButtons(add);            // 要不要賭，先把牌理清楚再說
     return;
   }
 
   if (state.phase === 'BET_RESPOND') {
-    if (state.bet.declarer === me.seat) { add('等三家表態', '', () => {}, true); return; }
-    if (state.bet.responded.includes(me.seat)) { add('已表態', '', () => {}, true); return; }
+    if (state.bet.declarer === me.seat) { add('等三家表態', '', () => {}, true); addTidyButtons(add); return; }
+    if (state.bet.responded.includes(me.seat)) { add('已表態', '', () => {}, true); addTidyButtons(add); return; }
     add('同意對賭', 'btn-danger', () =>
       socket.emit('respondBet', { accept: true }, (r) => { if (!r.ok) toast(r.reason, true); }));
     add('不同意', '', () =>
       socket.emit('respondBet', { accept: false }, (r) => { if (!r.ok) toast(r.reason, true); }));
+    addTidyButtons(add);            // 表態之前先分組，看清楚自己有幾手
     return;
   }
 
@@ -729,8 +782,7 @@ function renderActions() {
     if (state.turn !== me.seat) {
       add(`等 ${nameOf(state.turn)} 出牌`, '', () => {}, true);
       // 等別人的時候正好可以理牌
-      if (selected.size >= 2) add('分成一組', '', makeGroup);
-      if (selected.size) add('重選', '', () => { selected.clear(); render(); });
+      addTidyButtons(add);
       return;
     }
     add(`出牌（${selected.size} 張）`, 'btn-primary', () => {
@@ -739,8 +791,7 @@ function renderActions() {
         if (!r.ok) toast(r.reason, true); else selected.clear();
       });
     }, !selected.size);
-    if (selected.size >= 2) add('分成一組', '', makeGroup);
-    if (selected.size) add('重選', '', () => { selected.clear(); render(); });
+    addTidyButtons(add);
     add('不出', '', () => {
       socket.emit('pass', {}, (r) => { if (!r.ok) toast(r.reason, true); });
     }, state.isNewRound);
@@ -918,24 +969,49 @@ function propose(kind, target) {
   });
 }
 
+let holdTick = null;
+
+function holdText(until) {
+  if (!until) return '';
+  const left = Math.max(0, until - Date.now());
+  if (left <= 0) return '等候時間到了';
+  const m = Math.floor(left / 60000);
+  const sec = Math.floor((left % 60000) / 1000);
+  return `還等 ${m}:${String(sec).padStart(2, '0')}`;
+}
+
 function renderPause() {
   const box = $('pause');
+  if (holdTick) { clearInterval(holdTick); holdTick = null; }
   if (!state.paused) { box.classList.add('hidden'); box.innerHTML = ''; return; }
-  const { seat, name } = state.paused;
+  const { seat, name, until, extends: exts } = state.paused;
+  const expired = until && Date.now() >= until;
   box.classList.remove('hidden');
   box.innerHTML = `
     <div class="pause-card">
       <div class="pause-title">${name} 斷線了</div>
       <div class="pause-sub">
-        牌局停在原地等他回來，手牌和輪次都不會變。<br>
-        沒有時間限制，等多久都可以。
+        牌局打到輪到他才停下來等，手牌不會變。<br>
+        等不到就按「換電腦代打」— 他回來隨時可以把位子要回去。
       </div>
-      <button class="btn" id="btn-prop-bot">提議換電腦代打</button>
-      <button class="btn" id="btn-prop-end">提議結束這一局</button>
-      <div class="pause-note">兩個都要在場的人全部同意</div>
+      <div class="hold-line ${expired ? 'hold-out' : ''}" id="hold-left">${holdText(until)}</div>
+      <button class="btn btn-primary" id="btn-hold">再等 5 分鐘</button>
+      <button class="btn ${expired ? 'btn-danger' : ''}" id="btn-prop-bot">換電腦代打</button>
+      <button class="btn ${expired ? 'btn-danger' : ''}" id="btn-prop-end">提議結束這一局</button>
+      <div class="pause-note">${exts ? `已經延長 ${exts} 次 · ` : ''}換電腦：誰按都算。結束這一局：要全部同意</div>
     </div>`;
+  $('btn-hold').onclick = () => socket.emit('extendHold', {},
+    (r) => { if (!r.ok) toast(r.reason, true); });
   $('btn-prop-bot').onclick = () => propose('BOT', seat);
   $('btn-prop-end').onclick = () => propose('END');
+  if (until) {
+    holdTick = setInterval(() => {
+      const el = $('hold-left');
+      if (!el) { clearInterval(holdTick); holdTick = null; return; }
+      el.textContent = holdText(until);
+      if (Date.now() >= until) el.classList.add('hold-out');
+    }, 1000);
+  }
 }
 
 // §I 已經沒有任何倒數了。這裡只負責把舊的計時器欄位清乾淨。
