@@ -29,7 +29,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const G = H.G, M = H.M;
   // 座位 0 = 真人（等一下讓他斷線），1~3 = 電腦
-  G.players.push({ id: 'h0', token: 't0', isAI: false, name: '阿媽', connected: true, mjScore: 0 });
+  G.players.push({ id: 'h0', token: 't0', isAI: false, name: '阿媽', connected: true, live: true, mjScore: 0 });
   for (let k = 1; k < 4; k++) G.players.push({ id: 'b' + k, token: null, isAI: true, name: '電腦' + k, connected: true, mjScore: 0 });
   M.seats = [0, 1, 2, 3].map((pi) => ({ pi, hand: [], melds: [], flowers: [], discards: [], drawn: null, auto: false }));
   M.phase = 'play'; M.handOver = false; M.seq = 1; M.claimSeq = 0;
@@ -45,8 +45,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   M.claimUntil = Date.now() + 10;
 
   // ── 1. 人斷線了 ────────────────────────────────────────────────
-  G.players[0].connected = false;
-  ok('斷線之後就不算「有人看著」', !H.mjSeatWatching(0));
+  // v2.1：真實情況是手機一斷線，connected 還會亮 5 分鐘（寬限期），只有 live 立刻變 false。
+  G.players[0].live = false;
+  ok('寬限期內（connected 還亮著）也不算「有人看著」', G.players[0].connected === true && !H.mjSeatWatching(0));
 
   const cs = ++M.claimSeq, sq = M.seq;
   H.mjClaimTimeout(cs, sq);                    // 10 秒到，視窗到期
@@ -61,7 +62,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     String(M.claimUntil - Date.now()));
 
   // ── 2. 人回來了 → 視窗照常運作 ─────────────────────────────────
-  G.players[0].connected = true;
+  G.players[0].live = true;
   ok('回來之後又算「有人看著」', H.mjSeatWatching(0));
   H.mjClaimTimeout(cs, sq);
   ok('人在線上，10 秒到就照規則算 PASS，牌桌不會卡住', !M.pending || M.pending.claims[0].resp !== null,
@@ -70,7 +71,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // ── 3. 交給電腦 → 視窗立刻放行 ─────────────────────────────────
   M.pending = { kind: 'discard', tile: 1, from: 1,
     claims: [{ seat: 0, opts: { win: false, pong: true, gang: false, chi: [] }, resp: null }] };
-  G.players[0].connected = false;
+  G.players[0].live = false;
   M.seats[0].auto = true;
   ok('交給電腦之後不再算「等真人」', !H.mjSeatWatching(0));
   const cs2 = ++M.claimSeq;

@@ -706,7 +706,7 @@ function mjStartTurn(s,afterGang){
   st.drawn=t;
   M.lastDrawGang=!!afterGang && arguments[1]===true;
   broadcast();
-  if(isBotSeat(s)) mjLater(750,()=>botSelfMove(s));
+  if(isBotSeat(s)) mjLater(750,()=>{ if(isBotSeat(s)) botSelfMove(s); });
 }
 function gangDraw(s){
   if(M.handOver) return;
@@ -726,14 +726,14 @@ function gangDraw(s){
   st.drawn=t;
   M.lastDrawGang=true;
   broadcast();
-  if(isBotSeat(s)) mjLater(750,()=>botSelfMove(s));
+  if(isBotSeat(s)) mjLater(750,()=>{ if(isBotSeat(s)) botSelfMove(s); });
 }
 function enterDiscard(s){ // after 吃/碰 — must discard, no draw
   M.turn=s;
   M.seats[s].drawn=null;
   M.lastDrawGang=false;
   broadcast();
-  if(isBotSeat(s)) mjLater(700,()=>botDiscard(s));
+  if(isBotSeat(s)) mjLater(700,()=>{ if(isBotSeat(s)) botDiscard(s); });
 }
 function selfOptions(s){
   const st=M.seats[s];
@@ -784,7 +784,9 @@ function mjSeatWatching(q){
   const st=M.seats[q]; if(!st) return false;
   if(st.auto) return false;
   const p=seatP(q);
-  return !!p && !p.isAI && !!p.connected;
+  // v2.1（IND DIR 2026-09-27）：看「現在真的連著」(live)，不是 5 分鐘寬限期的 connected。
+  // 手機一斷線 connected 還會亮著 5 分鐘，以前這段時間 10 秒一到就被自動 PASS。
+  return !!p && !p.isAI && !!p.live;
 }
 /**
  * 宣告視窗到期時要不要硬幫人家 PASS。
@@ -1347,12 +1349,12 @@ function brStep(){
   if(BR.handOver||BR.phase!=="play") return;
   const s=BR.turn;
   if(BR.stage==="auction"){
-    if(brIsBot(s)) brLater(900,()=>{ if(BR.turn===s&&BR.stage==="auction") brCall(s,brAIBid(s)); });
+    if(brIsBot(s)) brLater(900,()=>{ if(BR.turn===s&&BR.stage==="auction"&&brIsBot(s)) brCall(s,brAIBid(s)); });
     return;
   }
   if(BR.stage!=="play") return;
   const ctrl=brController(s);
-  if(brIsBot(ctrl)) brLater(BR.trick.length===0?600:450,()=>{ if(BR.turn===s&&BR.stage==="play"&&!BR.handOver){
+  if(brIsBot(ctrl)) brLater(BR.trick.length===0?600:450,()=>{ if(BR.turn===s&&BR.stage==="play"&&!BR.handOver&&brIsBot(ctrl)){
     const c=brAIPlay(s); if(c!==undefined&&c!==null) brPlay(s,c); }});
 }
 function brResumeAuto(s){ if(BR.stage==="auction"){ if(BR.turn===s) brStep(); }
@@ -2084,6 +2086,29 @@ function privateFor(token){
     } : null
   };
 }
+/**
+ * v2.1（IND DIR 2026-09-27）：麻將／橋牌的位子如果是「因為人不在」才交給電腦
+ * （被踢、離開、或他離線時被按代打），本人一連回來就還他。
+ * 自己在線上時主動按「電腦代打」的，不會因為重新連線被取消。
+ */
+function reclaimAwaySeats(p){
+  const pi=G.players.indexOf(p);
+  if(pi<0) return;
+  if(M.phase==="play"&&M.seats){
+    const s=M.seats.findIndex(st=>st.pi===pi);
+    if(s>=0&&M.seats[s].auto&&M.seats[s].autoAway){
+      M.seats[s].auto=false; M.seats[s].autoAway=false;
+      mjBanner(seatName(s)+" 回來了，自己打。");
+    }
+  }
+  if(BR.phase==="play"&&BR.seats){
+    const s=BR.seats.findIndex(st=>st.pi===pi);
+    if(s>=0&&BR.seats[s].auto&&BR.seats[s].autoAway){
+      BR.seats[s].auto=false; BR.seats[s].autoAway=false;
+      brBanner(brName(s)+" 回來了，自己打｜"+BSEATS[s]+" is back.");
+    }
+  }
+}
 function sendTo(c){
   let payload;
   if(G.game==="mahjong") payload={ game:"mahjong", pub:mjPublicState(), me: c.token? mjPrivateFor(c.token):null };
@@ -2144,9 +2169,10 @@ const server=http.createServer(async (req,res)=>{
     const c={res,token};
     clients.push(c);
     const p=G.players.find(x=>x.token===token);
-    if(p){ if(p.offTimer){ clearTimeout(p.offTimer); p.offTimer=null; } p.connected=true;
+    if(p){ if(p.offTimer){ clearTimeout(p.offTimer); p.offTimer=null; } p.connected=true; p.live=true;
       // 本人回來了 → 位子還他，已經做過的不回捲（CIO 2026-08-23）
       if(p.auto){ p.auto=false; banner(p.name+" 回來了，位子還他｜"+p.name+" is back."); }
+      reclaimAwaySeats(p);
     }
     sendTo(c); if(p) broadcast();
     // heartbeat: keeps proxies (Render/nginx) from killing an idle stream
@@ -2155,6 +2181,7 @@ const server=http.createServer(async (req,res)=>{
       const q=G.players.find(x=>x.token===token);
       if(!q) return;
       if(clients.some(x=>x.token===token)) return;      // another tab still open
+      q.live=false;                                      // 座位保留，但現在沒有人看著
       if(q.offTimer) clearTimeout(q.offTimer);
       // GRACE: phone backgrounded / screen locked -> stay seated, don't flip offline
       q.offTimer=setTimeout(()=>{ q.offTimer=null;
@@ -2248,7 +2275,7 @@ const server=http.createServer(async (req,res)=>{
     if(G.game==="bridge"&&BR.phase==="play"){
       const s=BR.seats.findIndex(st=>st.pi===i);
       if(s>=0&&!BR.handOver&&!brSeatP(s).isAI&&!BR.seats[s].auto){
-        BR.seats[s].auto=true; brBanner(brName(s)+" 改由電腦代打｜"+BSEATS[s]+" is now played by the computer.");
+        BR.seats[s].auto=true; BR.seats[s].autoAway=true; brBanner(brName(s)+" 改由電腦代打｜"+BSEATS[s]+" is now played by the computer.");
         broadcast(); brResumeAuto(s);
       }
       return json(res,{ok:1});
@@ -2256,7 +2283,7 @@ const server=http.createServer(async (req,res)=>{
     if(G.game==="mahjong"&&M.phase==="play"){
       const s=M.seats.findIndex(st=>st.pi===i);
       if(s>=0&&!M.handOver&&!seatP(s).isAI&&!M.seats[s].auto){
-        M.seats[s].auto=true; mjBanner(seatName(s)+" 改由電腦代打。"); broadcast(); mjResumeAuto(s);
+        M.seats[s].auto=true; M.seats[s].autoAway=true; mjBanner(seatName(s)+" 改由電腦代打。"); broadcast(); mjResumeAuto(s);
         if(M.pending){ const c=M.pending.claims.find(x=>x.seat===s&&x.resp===null);
           if(c){ c.resp=botClaim(s,c.opts,M.pending.tile)||{t:"pass"};
             if(M.pending.claims.every(x=>x.resp!==null)){ M.claimSeq++; resolveClaims(); } else broadcast(); } }
@@ -2285,7 +2312,7 @@ const server=http.createServer(async (req,res)=>{
       const pi0=G.players.findIndex(x=>x.token===b.token);
       const s0=BR.seats.findIndex(st=>st.pi===pi0);
       if(s0>=0){
-        if(!BR.seats[s0].auto){ BR.seats[s0].auto=true;
+        if(!BR.seats[s0].auto){ BR.seats[s0].auto=true; BR.seats[s0].autoAway=true;
           brBanner(brName(s0)+" 離開 — 電腦代打｜"+BSEATS[s0]+" left — computer takes over.");
           broadcast(); brResumeAuto(s0); }
         return json(res,{ok:1});
@@ -2295,7 +2322,7 @@ const server=http.createServer(async (req,res)=>{
       const pi=G.players.findIndex(x=>x.token===b.token);
       const s=M.seats.findIndex(st=>st.pi===pi);
       if(s>=0){
-        if(!M.seats[s].auto){ M.seats[s].auto=true; mjBanner(seatName(s)+" 離開 — 電腦代打。"); broadcast(); mjResumeAuto(s); }
+        if(!M.seats[s].auto){ M.seats[s].auto=true; M.seats[s].autoAway=true; mjBanner(seatName(s)+" 離開 — 電腦代打。"); broadcast(); mjResumeAuto(s); }
         return json(res,{ok:1});
       }
     }
@@ -2473,6 +2500,7 @@ const server=http.createServer(async (req,res)=>{
     if(!(s>=0&&s<4)||!M.seats[s]) return json(res,{error:"Bad seat."},400);
     if(seatP(s).isAI) return json(res,{error:"這是電腦玩家。"},400);
     M.seats[s].auto=!M.seats[s].auto;
+    M.seats[s].autoAway = M.seats[s].auto && !seatP(s).live;   // 他不在時被按代打 → 回來就還他
     mjBanner(seatName(s)+(M.seats[s].auto?" 改由電腦代打。":" 恢復自己打。"));
     broadcast();
     if(M.seats[s].auto) mjResumeAuto(s);
@@ -2543,6 +2571,7 @@ const server=http.createServer(async (req,res)=>{
     if(!(s>=0&&s<4)||!BR.seats[s]) return json(res,{error:"Bad seat."},400);
     if(brSeatP(s).isAI) return json(res,{error:"這是電腦玩家。"},400);
     BR.seats[s].auto=!BR.seats[s].auto;
+    BR.seats[s].autoAway = BR.seats[s].auto && !brSeatP(s).live;
     brBanner(brName(s)+(BR.seats[s].auto?" 改由電腦代打｜computer takes over":" 恢復自己打｜back in the driver's seat"));
     broadcast();
     if(BR.seats[s].auto) brResumeAuto(s);
