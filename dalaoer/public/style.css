@@ -637,3 +637,12 @@ body::before {
 /* ---- 教練模式 ---- */
 .btn-coach-on{background:#2f7d3e;color:#fff;border-color:#2f7d3e;}
 .coach-tally{font-size:.78rem;color:#2f7d3e;font-weight:600;margin:4px 2px 2px;}
+
+/* v1.10 重新連線提示條 */
+.conn-banner {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 70;
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  text-align: center; font-size: 17px; font-weight: 700;
+  color: var(--ivory); background: var(--vermilion);
+}
+.conn-banner.hidden { display: none; }

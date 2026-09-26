@@ -3,7 +3,7 @@
    Run:   node lu_family_portal.js
    TV:    open the printed URL on the big screen  (host view)
    Phones: scan the QR shown on the TV            (player view)
-   Fixed-limit 10/20 · blinds 5/10 · 2–5 players · AI fill
+   Fixed-limit 10/20 · blinds 5/10 · 2–8 players · AI fill
    ============================================================ */
 "use strict";
 const http = require("http");
@@ -15,7 +15,8 @@ const PORT = process.env.PORT || 3000;
 const SB=5, BB=10, SMALL_BET=10, BIG_BET=20, CAP=4;
 const SUITS=["♠","♥","♦","♣"], RNAME={11:"J",12:"Q",13:"K",14:"A"};
 const HAND_NAMES=["High card","Pair","Two pair","Three of a kind","Straight","Flush","Full house","Four of a kind","Straight flush"];
-const AI_NAMES=["Bot Ada","Bot Ben","Bot Cleo","Bot Dex"];
+const AI_NAMES=["Bot Ada","Bot Ben","Bot Cleo","Bot Dex","Bot Eve","Bot Finn","Bot Gus"];
+const POKER_MAX=8;   // CIO 2026-09-27：撲克最多 8 人
 
 /* 桌號：開機時產生一次。四個人的手機上如果看到同一個桌號，就是同一桌。
    （這台伺服器只有一桌，桌號是給人確認用的，不是用來分房間的。）*/
@@ -2170,7 +2171,7 @@ const server=http.createServer(async (req,res)=>{
       if(p) return json(res,{token:p.token,name:p.name}); }
     if(G.game==="poker"&&G.phase!=="lobby") return json(res,{error:"牌局進行中 — 請等這場結束再加入。"},400);
     const humans=G.players.filter(p=>!p.isAI).length;
-    if(humans>=5) return json(res,{error:"Table full (5 max)."},400);
+    if(humans>=POKER_MAX) return json(res,{error:"Table full ("+POKER_MAX+" max)."},400);
     const name=String(b.name||"").trim().slice(0,14)||("Player "+(humans+1));
     const token=crypto.randomBytes(8).toString("hex");
     G.players.push({id:crypto.randomBytes(4).toString("hex"),token,isAI:false,name,
@@ -2190,8 +2191,8 @@ const server=http.createServer(async (req,res)=>{
     const bl={"5":[5,10],"10":[10,20],"25":[25,50]}[String(b.blinds)]||[5,10];
     G.sbA=bl[0]; G.bbA=bl[1]; G.lastRaise=G.bbA;
     G.players.forEach(p=>{ p.chips=G.stack; p.start=G.stack; p.handsWon=0; p.won=false; p.wagered=0; });
-    const ai=Math.max(0,Math.min(4,b.ai|0));
-    for(let k=0;k<ai&&G.players.length<5;k++)
+    const ai=Math.max(0,Math.min(POKER_MAX-1,b.ai|0));
+    for(let k=0;k<ai&&G.players.length<POKER_MAX;k++)
       G.players.push({id:"ai"+k,token:null,isAI:true,name:AI_NAMES[k],
         chips:G.stack,start:G.stack,handsWon:0,hole:[],folded:false,allIn:false,
         bet:0,total:0,need:false,inHand:false,won:false,showName:"",connected:true,
@@ -2649,7 +2650,7 @@ const PORTAL_BODY=`
       <div class="gameCards">
         <div class="gameCard" id="gcPoker" onclick="api('/api/portal',{game:'poker'})">
           <div class="big">🃏</div><h2>德州撲克</h2>
-          <div class="gcsub">Family Hold'em · 2–5人 · AI 補位</div>
+          <div class="gcsub">Family Hold'em · 2–8人 · AI 補位</div>
           <div class="live hidden" id="gcPokerLive">進行中 LIVE</div>
         </div>
         <div class="gameCard" id="gcMahjong" onclick="api('/api/portal',{game:'mahjong'})">
@@ -2847,6 +2848,8 @@ border:9px solid var(--rail);border-radius:50%/50%;box-shadow:inset 0 0 60px rgb
 border-radius:13px;padding:8px 9px;box-shadow:0 3px 10px rgba(0,0,0,.18);}
 .seatAbs.turn{border-color:var(--gold);box-shadow:0 0 0 3px var(--gold),0 3px 10px rgba(0,0,0,.2);}
 .seatAbs.out{opacity:.55;}
+.tableWrap.many .seatAbs{width:128px;padding:6px 7px;}
+.tableWrap.many .seatAbs .hole{min-height:44px;}
 .seatAbs .nm{font-weight:700;font-size:.84rem;display:flex;gap:5px;align-items:center;flex-wrap:wrap;}
 .seatAbs .chips{font-size:.82rem;color:var(--mut);}
 .seatAbs .betAmt{font-size:.74rem;color:var(--warn);min-height:1em;}
@@ -2854,7 +2857,7 @@ border-radius:13px;padding:8px 9px;box-shadow:0 3px 10px rgba(0,0,0,.18);}
 .seatAbs .hn{font-size:.68rem;color:var(--ok);min-height:.9em;}
 .kick{border:1px solid #c98484;background:#fbeeee;color:#8c2f2f;border-radius:6px;font-size:.62rem;padding:2px 6px;cursor:pointer;margin-left:auto;}
 .av{width:26px;height:26px;border-radius:50%;background:#e4ddc9 center/cover no-repeat;display:inline-block;border:1px solid var(--line);flex:none;}
-@media(max-width:760px){.tableWrap{padding-bottom:135%;}.seatAbs{width:120px;padding:6px;}.center{width:72%;}
+@media(max-width:760px){.tableWrap{padding-bottom:135%;}.seatAbs{width:120px;padding:6px;}.tableWrap.many .seatAbs{width:98px;padding:5px;}.center{width:72%;}
 .card{width:36px;height:52px;font-size:.9rem;}.card.sm{width:30px;height:44px;font-size:.8rem;}}
 .panel{position:fixed;inset:0;background:rgba(30,32,28,.5);z-index:55;display:flex;align-items:center;justify-content:center;}
 .panelIn{background:var(--cream);border-radius:16px;width:92%;max-width:640px;padding:20px;max-height:80vh;overflow:auto;}
@@ -2955,14 +2958,14 @@ border-radius:13px;padding:8px 9px;box-shadow:0 3px 10px rgba(0,0,0,.18);}
           <button data-v="500">500</button><button data-v="1000" class="on">1000</button><button data-v="2000">2000</button>
         </div>
         <div class="pill" id="pillAI">
-          <button data-v="0" class="on">0 AI</button><button data-v="1">1 AI</button><button data-v="2">2 AI</button><button data-v="3">3 AI</button><button data-v="4">4 AI</button>
+          <button data-v="0" class="on">0 AI</button><button data-v="1">1 AI</button><button data-v="2">2 AI</button><button data-v="3">3 AI</button><button data-v="4">4 AI</button><button data-v="5">5 AI</button><button data-v="6">6 AI</button><button data-v="7">7 AI</button>
         </div>
         <div class="pill" id="pillSkill">
           <button data-v="beg">AI: Beginner</button><button data-v="int" class="on">Intermediate</button><button data-v="adv">Advanced</button>
         </div>
       </div>
       <button class="startBtn" onclick="startGame()">Start the session</button>
-      <div class="sub" style="margin-top:10px">Need 2–5 total. Empty seats can be filled with AI.</div>
+      <div class="sub" style="margin-top:10px">Need 2–8 total. Empty seats can be filled with AI.</div>
     </div>
   </div>
 </div>
@@ -3182,6 +3185,7 @@ function render(){
   document.querySelectorAll("#tableWrap .seatAbs").forEach(e=>e.remove());
   const wrap=document.getElementById("tableWrap");
   const n=S.players.length;
+  wrap.classList.toggle("many",n>5);
   S.players.forEach((p,i)=>{
     const d=document.createElement("div");
     d.className="seatAbs"+(i===S.turn&&!S.handOver&&p.inHand&&!p.folded?" turn":"")+((!p.inHand||p.folded||p.removed)?" out":"");
@@ -3215,7 +3219,8 @@ function render(){
 }
 function seatPos(i,n){
   const th=(90+i*360/n)*Math.PI/180;
-  return {x:50+42*Math.cos(th), y:50+45*Math.sin(th)};
+  const rx=n>5?44:42, ry=n>5?46:45;
+  return {x:50+rx*Math.cos(th), y:50+ry*Math.sin(th)};
 }
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function openStats(){

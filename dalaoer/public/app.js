@@ -66,47 +66,97 @@ function hideSheet() { $('overlay').classList.add('hidden'); }
 // ───────────────────────────────────────── 重連用的識別（規範 §8.3）
 // 只記在這台裝置上，沒有帳號也沒有密碼
 
+// v1.10：同時記在分頁（window.name）和這支手機（localStorage）。
+//   分頁被瀏覽器關掉或丟掉時 window.name 會消失，localStorage 還在，
+//   所以開新分頁也能把位子要回去。分頁那份優先，桌機開多個分頁測試不會互搶。
+const TICKET_KEY = 'dalaoer_ticket';
+
 function saveTicket(code, token, name) {
   if (!code || !token) return;
-  try {
-    window.name = JSON.stringify({ dalaoer: { code, token, name } });
-  } catch (e) { /* 無所謂，最多就是要重打名字 */ }
+  const t = JSON.stringify({ dalaoer: { code, token, name } });
+  try { window.name = t; } catch (e) { /* 無所謂 */ }
+  try { localStorage.setItem(TICKET_KEY, t); } catch (e) { /* 無痕模式可能不給存 */ }
 }
 
-function readTicket(code) {
-  try {
-    const t = JSON.parse(window.name || '{}').dalaoer;
-    if (t && (!code || t.code === code)) return t.token;
-  } catch (e) { /* 沒有就算了 */ }
-  return undefined;
+function clearTicket() {
+  try { window.name = ''; } catch (e) { /* 無所謂 */ }
+  try { localStorage.removeItem(TICKET_KEY); } catch (e) { /* 無所謂 */ }
 }
 
 function readTicketFull() {
-  try { return JSON.parse(window.name || '{}').dalaoer || null; } catch (e) { return null; }
+  const parse = (raw) => { try { return JSON.parse(raw || '{}').dalaoer || null; } catch (e) { return null; } };
+  let t = parse(window.name);
+  if (!t || !t.code || !t.token) {
+    try { t = parse(localStorage.getItem(TICKET_KEY)); } catch (e) { t = null; }
+  }
+  return (t && t.code && t.token) ? t : null;
+}
+
+function readTicket(code) {
+  const t = readTicketFull();
+  if (t && (!code || t.code === code)) return t.token;
+  return undefined;
 }
 
 // ───────────────────────────────────────── 進入畫面
 
 /**
- * 一進頁面就先看看這台裝置上有沒有上次的座位。
- * 有的話直接帶著 token 回去，不用重打名字和房號。
- * 這就是斷線之後的「回來玩」——不需要另外一顆按鈕。
+ * v1.10 自動回座：每一次連上伺服器（第一次打開、斷線後自動重連、螢幕解鎖）
+ * 都帶著 token 把位子要回來。以前只在打開頁面時做一次，
+ * 中途斷線重連之後手機其實已經不在牌局裡了。
  */
-(function autoRejoin() {
+let wasDisconnected = false;
+
+function setConnBanner(text) {
+  let el = $('conn-banner');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'conn-banner';
+    el.className = 'conn-banner hidden';
+    document.body.appendChild(el);
+  }
+  if (!text) { el.classList.add('hidden'); return; }
+  el.textContent = text;
+  el.classList.remove('hidden');
+}
+
+function rejoinSaved() {
   const t = readTicketFull();
-  if (!t || !t.code || !t.token) return;
-  socket.on('connect', function once() {
-    socket.off('connect', once);
-    socket.emit('joinRoom', { code: t.code, name: t.name, token: t.token }, (r) => {
-      if (!r || !r.ok) return;                 // 房間沒了就當作沒事，留在入口畫面
-      me.seat = r.seat; me.code = r.code; me.name = t.name;
-      saveTicket(r.code, r.token, t.name);
-      $('panel-entry').classList.add('hidden');
-      $('panel-room').classList.remove('hidden');
-      toast(r.resumed ? '歡迎回來，回到你原本的位子' : '已重新入座');
-    });
+  if (!t) { if (wasDisconnected) setConnBanner(''); wasDisconnected = false; return; }
+  socket.emit('joinRoom', { code: t.code, name: t.name, token: t.token }, (r) => {
+    if (!r || !r.ok) {
+      // 房間已經收掉了：清掉舊票，留在入口畫面
+      if (r && r.reason === '找不到這個房間') clearTicket();
+      if (wasDisconnected) toast(r && r.reason ? r.reason : '回不到原本的位子', true);
+      setConnBanner('');
+      wasDisconnected = false;
+      return;
+    }
+    me.seat = r.seat; me.code = r.code; me.name = t.name;
+    saveTicket(r.code, r.token, t.name);
+    $('panel-entry').classList.add('hidden');
+    $('panel-room').classList.remove('hidden');
+    setConnBanner('');
+    if (wasDisconnected || r.resumed) toast('已回到你的座位');
+    wasDisconnected = false;
   });
-}());
+}
+
+socket.on('connect', rejoinSaved);
+
+socket.on('disconnect', () => {
+  wasDisconnected = true;
+  setConnBanner('連線中斷，正在重新連線…');
+});
+
+// 手機螢幕解鎖、切回瀏覽器、網路恢復：不等重試計時，馬上重連
+function wake() {
+  if (!socket.connected) socket.connect();
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+window.addEventListener('pageshow', wake);
+window.addEventListener('focus', wake);
+window.addEventListener('online', wake);
 
 $('btn-create').onclick = () => {
   const name = $('input-name').value.trim();
@@ -261,7 +311,17 @@ socket.on('toast', (msg) => toast(msg));
 
 // ───────────────────────────────────────── 牌桌
 
+// §CIO 2026-09-27：換牌、對賭這兩個決定之前，教練自動打開（玩家還是可以自己關掉）
+const COACH_AUTO_PHASES = ['SWAP_SELECT', 'BET_DECLARE'];
+let lastPhase = null;
+
 socket.on('state', (s) => {
+  if (s.phase !== lastPhase && COACH_AUTO_PHASES.includes(s.phase) && !coachOn) {
+    coachOn = true;
+    coachSig = '';
+    try { localStorage.setItem('dl_coach', '1'); } catch (e) { /* 無所謂 */ }
+  }
+  lastPhase = s.phase;
   state = s;
   me.seat = s.seat;
   me.hostSeat = s.hostSeat;
@@ -706,8 +766,7 @@ function renderActions() {
         if (!r.ok) toast(r.reason, true); else selected.clear();
       });
     });
-    if (selected.size >= 2) add('分成一組', '', makeGroup);
-    if (selected.size) add('重選', '', () => { selected.clear(); render(); });
+    addTidyButtons(add);            // v1.10：換牌前也看得到教練開關（預設自動打開）
     return;
   }
 
@@ -1100,4 +1159,3 @@ $('overlay').onclick = (e) => {
   if (e.target === $('overlay') && !$('sheet').dataset.keep) hideSheet();
 };
 
-socket.on('disconnect', () => toast('連線中斷，重新整理看看', true));

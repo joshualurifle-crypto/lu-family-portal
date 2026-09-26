@@ -534,6 +534,15 @@ class Game {
       this.trickNo++;
     }
     this.turn = next;
+
+    // §CIO 2026-09-27 張數不夠就自動跳過（規則 A）：
+    //   手上張數比桌上那手少，就不可能壓得過 —— 炸彈也是五張，一樣出不了。
+    //   只看張數（大家本來就看得到），不看牌面大小，所以不會洩漏手牌強弱。
+    if (!this.isNewRound() && this.hands[next].length < this.current.size) {
+      this.passed[next] = true;
+      this.log.push(`${this.players[next]} 只剩 ${this.hands[next].length} 張，壓不了${this.current.label}，自動不出`);
+      this._advanceTurn();
+    }
   }
 
   // -------------------------------------------------------------------------

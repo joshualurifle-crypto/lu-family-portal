@@ -57,6 +57,24 @@ async function backToSeating(c) {
   await until(() => c.__seating, '座位畫面');
 }
 
+/**
+ * v1.10：§Q（2026-08-23）之後，斷線的人要「真的輪到他」才凍結。
+ * 所以測試要把牌局推進到他那一手：輪到甲就 PASS（開牌時出最小一張）。
+ */
+async function driveUntilPaused(a, ms = 20000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    const s = a.__last;
+    if (s && s.paused) return true;
+    if (s && s.phase === 'PLAYING' && s.turn === s.seat) {
+      if (s.isNewRound) await emit(a, 'play', { cards: [Math.min(...s.hand)] });
+      else await emit(a, 'pass');
+    }
+    await sleep(60);
+  }
+  throw new Error('逾時：凍結');
+}
+
 async function until(fn, label, ms = 8000) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
@@ -170,7 +188,7 @@ async function main() {
   ok('乙也在牌局裡', !!b.__last);
 
   b.disconnect();
-  await until(() => a.__last && a.__last.paused, '凍結');
+  await driveUntilPaused(a);
   ok('牌局凍結了', !!a.__last.paused);
   ok('凍結時指名是誰掉線', a.__last.paused.name === '乙', JSON.stringify(a.__last.paused));
 
